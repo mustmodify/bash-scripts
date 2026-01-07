@@ -1,14 +1,20 @@
 #!/bin/bash
 
 # Usage: ./show_me /path/to/search
+# 2025-01-07 jw - automatically ignores .git and binary files
 
 if [ -z "$1" ]; then
   echo "Usage: $0 /path/to/search"
   exit 1
 fi
 
-find "$1" -type f | while IFS= read -r file; do
-  line_count=$(wc -l < "$file")
+find "$1" -type f -not -path '*/.git/*' | while IFS= read -r file; do
+  # Skip binary files
+  if file --mime "$file" | grep -q 'charset=binary'; then
+    continue
+  fi
+  
+  line_count=$(wc -l < "$file" 2>/dev/null || echo "0")
   echo
   echo "$file ($line_count lines)"
   echo "-----------------------------------"
