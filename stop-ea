@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+# Known ports for status check
+RAILS_PORT=3000
+VITE_PORT=3036   # adjust if your Vite uses 3123 sometimes
+REDIS_PORT=6379
+PG_PORT=5432
+
+# Patterns for killing app processes
+RAILS_PAT='bin/rails server'
+VITE_PAT='bin/vite dev'
+SIDEKIQ_PAT='bundle exec sidekiq'
+
+# Check if a TCP port is listening
+port_listening() {
+  local port="$1"
+  ss -ltn 2>/dev/null | awk -v P=":$port" '$1=="LISTEN" && $4 ~ P"$" {found=1} END{exit(!found)}'
+}
+
+# Show running status based on known ports
+show_status() {
+  echo "currently running:"
+  if port_listening "$RAILS_PORT"; then
+    echo "rails
+  - running
+  - responds on $RAILS_PORT"
+  else
+    echo "rails
+  - not running
+  - responds on —"
+  fi
+
+  if port_listening "$VITE_PORT"; then
+    echo "vite
+  - running
+  - responds on $VITE_PORT"
+  else
+    echo "vite
+  - not running
+  - responds on —"
+  fi
+
+  # Sidekiq has no port to check, so fall back to process grep
+  if pgrep -f "$SIDEKIQ_PAT" >/dev/null; then
+    echo "sidekiq
+  - running"
+  else
+    echo "sidekiq
+  - not running"
+  fi
+
+  if port_listening "$PG_PORT"; then
+    echo "postgresql
+  - running
+  - listens on $PG_PORT"
+  else
+    echo "postgresql
+  - not running"
+  fi
+
+  if port_listening "$REDIS_PORT"; then
+    echo "redis
+  - running
+  - listens on $REDIS_PORT"
+  else
+    echo "redis
+  - not running"
+  fi
+}
+
+# Kill by pattern if running
+stop_service() {
+  local name="$1" pat="$2"
+  echo "stopping $name..."
+  if pgrep -f "$pat" >/dev/null; then
+    pkill -f "$pat"
+    sleep 1
+    if pgrep -f "$pat" >/dev/null; then
+      pkill -9 -f "$pat"
+    fi
+    echo "$name: stopped"
+  else
+    echo "$name: not running"
+  fi
+}
+
+# Main
+show_status
+echo
+stop_service "rails" "$RAILS_PAT"
+stop_service "vite" "$VITE_PAT"
+stop_service "sidekiq" "$SIDEKIQ_PAT"
+echo
+show_status
+

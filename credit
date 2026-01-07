@@ -1,0 +1,1 @@
+EDITOR="vim" bin/rails credentials:edit -e ${1:-development}

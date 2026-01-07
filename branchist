@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# ==============================================================================
+# branchist - A script to show the most recently committed git branches.
+#
+# USAGE:
+#   ./branchist.sh [limit]
+#
+# PARAMETERS:
+#   limit (Optional): The number of recent branches to display. 
+#                     Defaults to 5 if no argument is provided.
+#
+# EXAMPLE:
+#   ./branchist.sh 10    # Shows the 10 most recent branches
+# ==============================================================================
+
+# Handle help flags
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+  grep '^#' "$0" | cut -c3- | sed -n '2,13p'
+  exit 0
+fi
+
+# Set the limit from the first argument, defaulting to 5 if not provided.
+LIMIT=${1:-5}
+
+# Basic check to ensure the parameter is a number
+if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+  echo "Error: '$LIMIT' is not a valid number."
+  echo "Usage: $0 [number]"
+  exit 1
+fi
+
+echo "Recent Branches ($LIMIT):"
+echo "----------------"
+
+# This command lists all branches sorted by the committer date of the last commit.
+# - The '--sort=-committerdate' option sorts the branches in descending order.
+# - The 'head -n $LIMIT' limits the output based on your parameter.
+git for-each-ref --sort=-committerdate --format='%(refname:short)|%(committerdate:format:%Y-%m-%d %H:%M:%S)|%(subject)' refs/heads/ | head -n "$LIMIT" | while IFS='|' read -r branch date message; do
+  formatted_message=$(echo "$message" | cut -c1-80)
+  echo "Branch: $branch"
+  echo "Date:   $date"
+  echo "Commit: $formatted_message"
+  echo ""
+done

@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Usage: ./show_me /path/to/search
+
+if [ -z "$1" ]; then
+  echo "Usage: $0 /path/to/search"
+  exit 1
+fi
+
+find "$1" -type f | while IFS= read -r file; do
+  line_count=$(wc -l < "$file")
+  echo
+  echo "$file ($line_count lines)"
+  echo "-----------------------------------"
+  cat "$file"
+  echo # add a blank line after each file for readability
+  echo
+  echo
+done

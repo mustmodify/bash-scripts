@@ -1,0 +1,265 @@
+#!/usr/bin/env ruby
+
+# tlist - GitHub Project Board Ticket Lister
+#
+# Description:
+#   Lists tickets from a GitHub Project Board grouped by status column.
+#   Fetches data using GitHub CLI (gh) and displays formatted ticket information
+#   including issue number, title, labels, type, and size.
+#
+# Usage:
+#   tlist [status_filter]
+#
+# Examples:
+#   tlist                    # List all tickets except "Done"
+#   tlist back               # List only "Backlog" tickets
+#   tlist est                # List only "Estimation" tickets
+#   tlist done               # List only "Done" tickets
+#   tlist "in prog"          # List only "In Progress" tickets
+#
+# Features:
+#   - Groups tickets by status in a predefined order
+#   - Excludes "Done" status by default (unless explicitly requested)
+#   - Truncates long titles to 50 characters
+#   - Handles pagination to fetch all project items
+#   - Strips emojis and special characters when matching status names
+#
+# Requirements:
+#   - Ruby
+#   - GitHub CLI (gh) installed and authenticated
+#   - Access to the specified GitHub organization and project
+#
+# Configuration:
+#   Edit ORG and PROJECT_NUMBER constants below to change target project
+
+require 'json'
+
+# Configuration
+ORG = ENV['GITHUB_ORG']
+PROJECT_NUMBER = ENV['GITHUB_PROJECT_NUMBER'] 
+
+# Define status order
+STATUS_ORDER = [
+  'Needs Definition',
+  'Estimation',
+  'Backlog',
+  'Fast Lane',
+  'Ready',
+  'In Progress'
+]
+
+# Get the status filter from command line argument
+status_filter = ARGV[0]&.downcase
+
+# Function to truncate title
+def truncate_title(title, length = 50)
+  title.length > length ? "#{title[0...length]}..." : title
+end
+
+# Function to normalize status for comparison (strip non-word characters)
+def normalize_status(status)
+  status.gsub(/[^\w\s]/, '').strip
+end
+
+# Function to get sort order for status
+def status_sort_key(status)
+  normalized = normalize_status(status)
+  index = STATUS_ORDER.find_index { |s| normalize_status(s) == normalized }
+  index ? [0, index] : [1, status]
+end
+
+# Function to fetch project data using gh CLI with pagination
+def fetch_project_data
+  # First, get the project ID
+  project_query = <<~GRAPHQL
+    query {
+      organization(login: "#{ORG}") {
+        projectV2(number: #{PROJECT_NUMBER}) {
+          id
+        }
+      }
+    }
+  GRAPHQL
+
+  result = `gh api graphql -f query='#{project_query}'`
+  project_data = JSON.parse(result)
+  project_id = project_data.dig('data', 'organization', 'projectV2', 'id')
+
+  unless project_id
+    puts "Error: Could not find project"
+    exit 1
+  end
+
+  # Fetch all items with pagination
+  all_items = []
+  has_next_page = true
+  after_cursor = nil
+  page_number = 1
+
+  while has_next_page
+    STDERR.puts "Retrieving Page #{page_number}"
+    
+    after_param = after_cursor ? %(after: "#{after_cursor}") : ""
+    
+    items_query = <<~GRAPHQL
+      query {
+        node(id: "#{project_id}") {
+          ... on ProjectV2 {
+            items(first: 100 #{after_param}) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                id
+                fieldValues(first: 20) {
+                  nodes {
+                    ... on ProjectV2ItemFieldTextValue {
+                      text
+                      field {
+                        ... on ProjectV2FieldCommon {
+                          name
+                        }
+                      }
+                    }
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                      field {
+                        ... on ProjectV2FieldCommon {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+                content {
+                  ... on Issue {
+                    number
+                    title
+                    labels(first: 10) {
+                      nodes {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    GRAPHQL
+
+    result = `gh api graphql -f query='#{items_query}'`
+    data = JSON.parse(result)
+    
+    items_data = data.dig('data', 'node', 'items')
+    page_items = items_data.dig('nodes') || []
+    all_items.concat(page_items)
+    
+    page_info = items_data.dig('pageInfo')
+    has_next_page = page_info&.dig('hasNextPage') || false
+    after_cursor = page_info&.dig('endCursor')
+    
+    page_number += 1
+  end
+
+  STDERR.puts ""  # Add blank line after retrieval messages
+  
+  { 'items' => all_items }
+end
+
+# Parse project data
+def parse_items(data)
+  items = data['items'] || []
+  
+  parsed_items = []
+  
+  items.each do |item|
+    content = item['content']
+    next unless content # Skip if no content
+    
+    issue_number = content['number']
+    title = content['title']
+    labels = content.dig('labels', 'nodes')&.map { |l| l['name'] } || []
+    
+    # Extract field values
+    field_values = {}
+    item.dig('fieldValues', 'nodes')&.each do |field_value|
+      field_name = field_value.dig('field', 'name')
+      value = field_value['name'] || field_value['text']
+      field_values[field_name] = value if field_name && value
+    end
+    
+    status = field_values['Status'] || 'No Status'
+    type_value = field_values['Type']
+    size_value = field_values['Size']
+    
+    parsed_items << {
+      number: issue_number,
+      title: title,
+      labels: labels,
+      status: status,
+      type: type_value,
+      size: size_value
+    }
+  end
+  
+  parsed_items
+end
+
+# Group items by status
+def group_by_status(items)
+  grouped = {}
+  items.each do |item|
+    status = item[:status]
+    grouped[status] ||= []
+    grouped[status] << item
+  end
+  grouped
+end
+
+# Format and display items
+def display_items(grouped_items, status_filter)
+  # Sort statuses by defined order
+  sorted_statuses = grouped_items.keys.sort_by { |status| status_sort_key(status) }
+  
+  sorted_statuses.each do |status|
+    items = grouped_items[status]
+    
+    # Exclude "Done" unless explicitly requested
+    if status_filter
+      next unless normalize_status(status).downcase.start_with?(status_filter)
+    else
+      next if normalize_status(status).downcase == 'done'
+    end
+    
+    puts status
+    puts "-" * 22
+    puts
+    
+    items.each do |item|
+      parts = []
+      parts << "#{truncate_title(item[:title])} ##{item[:number]}"
+      parts << item[:labels].join(' ') unless item[:labels].empty?
+      parts << item[:type] if item[:type]
+      parts << item[:size] if item[:size]
+      
+      puts parts.join(' | ')
+    end
+    
+    puts
+  end
+end
+
+# Main execution
+begin
+  data = fetch_project_data
+  items = parse_items(data)
+  grouped = group_by_status(items)
+  display_items(grouped, status_filter)
+rescue => e
+  puts "Error: #{e.message}"
+  puts "Make sure you have 'gh' CLI installed and authenticated."
+  exit 1
+end

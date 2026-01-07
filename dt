@@ -1,0 +1,23 @@
+#!/usr/bin/env ruby
+
+def last_line
+  `wc -l db/schema.rb`.to_i
+end
+
+table_lines = `grep create_table db/schema.rb -n`.split("\n").map{|l| l.gsub(/\:.*/, '').to_i}
+term = ARGV[0]
+
+table_starts = `grep "create_table.*#{term}" db/schema.rb -n`.split("\n")
+
+table_starts.each do |ts|
+  table_info = ts.match(/(\d*):  create_table ['"]([^'"]*)['"]/)
+  start_line = table_info[1].to_i
+  table_name = table_info[2]
+  end_line=(table_lines.select{|l| l > start_line}.min || last_line)- 3
+
+  puts "\n\n\n ====== [ #{table_name} ] ============================="
+  puts `head db/schema.rb -n #{end_line} | tail -n #{end_line - start_line}`
+end
+
+puts
+puts

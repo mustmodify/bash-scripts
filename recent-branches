@@ -1,0 +1,20 @@
+#!/bin/bash
+
+echo "=== Branches with commits in the last hour ==="
+echo
+
+# One-liner approach for branches with recent commits
+git for-each-ref --format='%(refname:short) %(committerdate:unix) %(committerdate:iso8601)' refs/heads/ refs/remotes/ | \
+while read branch timestamp readable_date; do
+    one_hour_ago=$(date -d '1 hour ago' '+%s')
+    if [ "$timestamp" -gt "$one_hour_ago" ]; then
+        echo "Branch: $branch"
+        echo "  Last commit: $readable_date"
+        echo "  $(git log -1 --oneline $branch)"
+        echo
+    fi
+done
+
+echo "=== Newly created branches (from reflog) ==="
+git reflog --since="1 hour ago" | grep "checkout: moving from" | \
+    awk -F'to ' '{print $2}' | sort -u

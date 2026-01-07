@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# --- Configuration ---
+TARGET_BRANCH="develop"
+# ---------------------
+
+# Function to display messages
+log() {
+    echo -e "\n\033[1m$1\033[0m" # Bold text
+}
+
+# Function to check if a branch is fully merged into the target branch
+# This works for both traditional merges and squash merges.
+is_merged() {
+    local branch_name="$1"
+    # Use --no-merged and grep -q to check if the branch is *not* in the list of unmerged branches.
+    # If it's not in the unmerged list, it is considered merged.
+    git branch --no-merged "$TARGET_BRANCH" | grep -q "^  $branch_name$"
+    # The return value of the grep command determines the function's return code.
+    # If grep finds the branch (it is *not* merged), it returns 0.
+    # We want to know if it IS merged, so we negate the result.
+    [ $? -ne 0 ]
+}
+
+# 1. Update the local repository
+log "🔄 Fetching the latest changes from all remotes..."
+git fetch --all --prune
+
+# 2. Switch to the target branch and pull the latest changes
+log "🎯 Checking out and updating the $TARGET_BRANCH branch..."
+git checkout "$TARGET_BRANCH"
+git pull origin "$TARGET_BRANCH"
+
+# 3. Get a list of all local branches, excluding the target and main branches
+log "🔍 Identifying branches merged into $TARGET_BRANCH..."
+# The main branch is often 'master' or 'main', so we include it in the exclusions just in case.
+# We also want to exclude the current working branch, which is $TARGET_BRANCH.
+EXCLUSIONS=("$TARGET_BRANCH" "master" "main")
+
+# Get a list of all local branches except the exclusions
+ALL_BRANCHES=$(git branch --format='%(refname:short)' | grep -v -E "$(IFS='|'; echo "${EXCLUSIONS[*]}")")
+
+DELETED_COUNT=0
+
+# 4. Loop through the branches and delete merged ones
+for branch in $ALL_BRANCHES; do
+    if is_merged "$branch"; then
+        log "✅ Deleting merged branch: $branch"
+        git branch -d "$branch"
+        if [ $? -eq 0 ]; then
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+        fi
+    else
+        echo "➡️ Keeping unmerged branch: $branch"
+    fi
+done
+
+# 5. Final summary
+log "🎉 Cleanup complete!"
+echo "Total branches deleted: $DELETED_COUNT"
+echo "You are currently on the **$TARGET_BRANCH** branch."

@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Kill any processes matching the commands in Procfile.dev
+echo "Killing lingering dev processes..."
+
+# List of partial commands from Procfile.dev
+PROCESSES=(
+  "bin/rails server"
+  "bin/vite dev"
+  "redis-server"
+  "bundle exec sidekiq"
+)
+
+for CMD in "${PROCESSES[@]}"; do
+  echo "Searching for: $CMD"
+  # Use pgrep with -f to match the full command line
+  PIDS=$(pgrep -f "$CMD")
+  if [ -n "$PIDS" ]; then
+    echo "Killing processes: $PIDS"
+    kill $PIDS
+  else
+    echo "No matching process found for: $CMD"
+  fi
+done
+
+echo "Cleanup complete."
