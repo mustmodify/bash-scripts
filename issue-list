@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# issue-list: List GitHub issues from earlyasset/earlyasset
+# Usage: issue-list [-n <count>] [-sort asc] [-status open|closed|all]
+
+count=30
+sort_order="desc"
+status="all"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n)
+      count="$2"
+      shift 2
+      ;;
+    -sort)
+      if [[ "$2" == "asc" ]]; then
+        sort_order="asc"
+      fi
+      shift 2
+      ;;
+    -status)
+      status="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: issue-list [-n <count>] [-sort asc] [-status open|closed|all]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Build gh command
+cmd=(gh issue list --repo earlyasset/earlyasset --limit "$count")
+
+case "$status" in
+  open)
+    cmd+=(--state open)
+    ;;
+  closed)
+    cmd+=(--state closed)
+    ;;
+  all)
+    cmd+=(--state all)
+    ;;
+  *)
+    echo "Invalid status: $status (must be open|closed|all)" >&2
+    exit 1
+    ;;
+esac
+
+# gh issue list returns newest first by default
+# For asc order, we need to use the oldest first
+if [[ "$sort_order" == "asc" ]]; then
+  # Fetch and reverse
+  "${cmd[@]}" --json number,title,state --jq '.[] | [.number, .title, .state] | @tsv' | tac | column -t -s $'\t'
+else
+  # Default newest first
+  "${cmd[@]}" --json number,title,state --jq '.[] | [.number, .title, .state] | @tsv' | column -t -s $'\t'
+fi

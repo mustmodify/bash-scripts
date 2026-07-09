@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Usage: remote <env-alias>
+# Opens a heroku rails console against the matching app.
+#
+# Aliases:
+#   prod, production  -> early-asset
+#   s, staging        -> early-asset-staging
+
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "Usage: remote <env-alias>" >&2
+  echo "  prod | production  -> early-asset" >&2
+  echo "  s | staging        -> early-asset-staging" >&2
+  exit 1
+fi
+
+case "$1" in
+  prod|production) app=early-asset ;;
+  s|staging)       app=early-asset-staging ;;
+  *)
+    echo "remote: unknown alias '$1'" >&2
+    echo "Known: prod, production, s, staging" >&2
+    exit 1
+    ;;
+esac
+
+exec heroku run rails c -a "$app"

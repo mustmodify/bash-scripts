@@ -1,0 +1,1 @@
+jq -r -f ~/bin/paths.jq $1 | sort -u

@@ -1,0 +1,342 @@
+#!/usr/bin/env ruby
+
+# tsync - GitHub Project Board Size to Estimate Syncer
+#
+# Description:
+#   Syncs the 'Size' field to the 'Estimate' field for tickets where they differ.
+#   Extracts the numeric value from sizes like "3 Points" and sets Estimate to 3.
+#
+# Usage:
+#   tsync           # Dry run - shows what would be updated
+#   tsync --apply   # Actually performs the updates
+#
+# Requirements:
+#   - Ruby
+#   - GitHub CLI (gh) installed and authenticated
+#   - Write access to the specified GitHub organization and project
+
+require 'json'
+
+# Configuration
+ORG = ENV['GITHUB_ORG']
+PROJECT_NUMBER = ENV['GITHUB_PROJECT_NUMBER']
+
+# Check if we should apply changes
+DRY_RUN = !ARGV.include?('--apply')
+
+if DRY_RUN
+  puts "=== DRY RUN MODE ==="
+  puts "Run with --apply to actually update tickets"
+  puts ""
+end
+
+# Function to extract number from size (e.g., "3 Points" -> 3)
+def extract_size_number(size)
+  return nil unless size
+  
+  # Convert to string and extract number
+  size_str = size.to_s
+  
+  match = size_str.match(/(\d+)/)
+  match ? match[1].to_i : nil
+end
+
+# Function to normalize value for comparison
+def normalize_value(value)
+  return nil if value.nil?
+  
+  # Convert to integer if it's a number
+  if value.is_a?(Numeric)
+    return value.to_i
+  end
+  
+  # Try to extract number from string
+  if value.is_a?(String)
+    match = value.match(/(\d+)/)
+    return match[1].to_i if match
+  end
+  
+  nil
+end
+
+# Function to fetch project data with field IDs
+def fetch_project_data
+  project_query = <<~GRAPHQL
+    query {
+      organization(login: "#{ORG}") {
+        projectV2(number: #{PROJECT_NUMBER}) {
+          id
+          fields(first: 20) {
+            nodes {
+              ... on ProjectV2Field {
+                id
+                name
+                dataType
+              }
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                dataType
+              }
+            }
+          }
+        }
+      }
+    }
+  GRAPHQL
+
+  result = `gh api graphql -f query='#{project_query}'`
+  project_data = JSON.parse(result)
+  
+  project_id = project_data.dig('data', 'organization', 'projectV2', 'id')
+  fields = project_data.dig('data', 'organization', 'projectV2', 'fields', 'nodes') || []
+  
+  unless project_id
+    puts "Error: Could not find project"
+    exit 1
+  end
+
+  # Find the Size and Estimate field IDs
+  size_field = fields.find { |f| f['name'] == 'Size' }
+  estimate_field = fields.find { |f| f['name'] == 'Estimate' }
+
+  unless size_field && estimate_field
+    puts "Error: Could not find Size and/or Estimate fields"
+    puts "Available fields: #{fields.map { |f| f['name'] }.join(', ')}"
+    exit 1
+  end
+
+  {
+    project_id: project_id,
+    size_field_id: size_field['id'],
+    estimate_field_id: estimate_field['id']
+  }
+end
+
+# Function to fetch all project items
+def fetch_project_items(project_id)
+  all_items = []
+  has_next_page = true
+  after_cursor = nil
+  page_number = 1
+
+  while has_next_page
+    STDERR.puts "Retrieving Page #{page_number}"
+
+    after_param = after_cursor ? %(after: "#{after_cursor}") : ""
+
+    items_query = <<~GRAPHQL
+      query {
+        node(id: "#{project_id}") {
+          ... on ProjectV2 {
+            items(first: 100 #{after_param}) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                id
+                fieldValues(first: 20) {
+                  nodes {
+                    ... on ProjectV2ItemFieldTextValue {
+                      text
+                      field {
+                        ... on ProjectV2FieldCommon {
+                          name
+                        }
+                      }
+                    }
+                    ... on ProjectV2ItemFieldNumberValue {
+                      number
+                      field {
+                        ... on ProjectV2FieldCommon {
+                          name
+                        }
+                      }
+                    }
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                      field {
+                        ... on ProjectV2FieldCommon {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+                content {
+                  ... on Issue {
+                    number
+                    title
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    GRAPHQL
+
+    result = `gh api graphql -f query='#{items_query}'`
+    data = JSON.parse(result)
+
+    items_data = data.dig('data', 'node', 'items')
+    page_items = items_data.dig('nodes') || []
+    all_items.concat(page_items)
+
+    page_info = items_data.dig('pageInfo')
+    has_next_page = page_info&.dig('hasNextPage') || false
+    after_cursor = page_info&.dig('endCursor')
+
+    page_number += 1
+  end
+
+  STDERR.puts ""
+
+  all_items
+end
+
+# Parse items and find mismatches
+def find_mismatches(items)
+  mismatches = []
+  
+  items.each do |item|
+    content = item['content']
+    next unless content
+
+    issue_number = content['number']
+    title = content['title']
+
+    # Extract field values
+    field_values = {}
+    item.dig('fieldValues', 'nodes')&.each do |field_value|
+      field_name = field_value.dig('field', 'name')
+      value = field_value['name'] || field_value['text'] || field_value['number']
+      field_values[field_name] = value if field_name
+    end
+
+    size = field_values['Size']
+    estimate = field_values['Estimate']
+
+    # Skip if no size
+    next unless size
+
+    # Extract numeric value from size (e.g., "3 Points" -> 3)
+    size_number = extract_size_number(size)
+    next unless size_number
+    
+    # Normalize estimate for comparison
+    estimate_normalized = normalize_value(estimate)
+    
+    # Check if they match
+    if size_number != estimate_normalized
+      mismatches << {
+        item_id: item['id'],
+        issue_number: issue_number,
+        title: title,
+        size: size,
+        current_estimate: estimate,
+        new_estimate: size_number
+      }
+    end
+  end
+
+  mismatches
+end
+
+# Update estimate field for an item
+def update_estimate(project_id, item_id, field_id, value)
+  mutation = <<~GRAPHQL
+    mutation {
+      updateProjectV2ItemFieldValue(
+        input: {
+          projectId: "#{project_id}"
+          itemId: "#{item_id}"
+          fieldId: "#{field_id}"
+          value: { 
+            number: #{value}
+          }
+        }
+      ) {
+        projectV2Item {
+          id
+        }
+      }
+    }
+  GRAPHQL
+
+  result = `gh api graphql -f query='#{mutation}'`
+  data = JSON.parse(result)
+  
+  if data['errors']
+    return { success: false, error: data['errors'].first['message'] }
+  end
+  
+  { success: true }
+end
+
+# Main execution
+begin
+  # Fetch project metadata
+  metadata = fetch_project_data
+  
+  # Fetch all items
+  items = fetch_project_items(metadata[:project_id])
+  
+  puts "Total items: #{items.length}"
+  
+  # Find mismatches
+  mismatches = find_mismatches(items)
+  
+  if mismatches.empty?
+    puts "✓ All tickets are in sync! No updates needed."
+    exit 0
+  end
+  
+  puts "Found #{mismatches.length} ticket(s) to update:"
+  puts ""
+  
+  updated_count = 0
+  failed_count = 0
+  
+  mismatches.each do |mismatch|
+    status_icon = DRY_RUN ? "→" : "⟳"
+    puts "#{status_icon} ##{mismatch[:issue_number]}: #{mismatch[:title][0..60]}"
+    puts "   Size: #{mismatch[:size]} | Current Estimate: #{mismatch[:current_estimate] || 'empty'} | New Estimate: #{mismatch[:new_estimate]}"
+    
+    unless DRY_RUN
+      result = update_estimate(
+        metadata[:project_id],
+        mismatch[:item_id],
+        metadata[:estimate_field_id],
+        mismatch[:new_estimate]
+      )
+      
+      if result[:success]
+        puts "   ✓ Updated"
+        updated_count += 1
+      else
+        puts "   ✗ Failed: #{result[:error]}"
+        failed_count += 1
+      end
+    end
+    
+    puts ""
+  end
+  
+  if DRY_RUN
+    puts ""
+    puts "=== DRY RUN COMPLETE ==="
+    puts "Run with --apply to perform these updates"
+  else
+    puts "=== UPDATE COMPLETE ==="
+    puts "Successfully updated: #{updated_count}"
+    puts "Failed: #{failed_count}" if failed_count > 0
+  end
+  
+rescue => e
+  puts "Error: #{e.message}"
+  puts e.backtrace.join("\n")
+  puts "Make sure you have 'gh' CLI installed and authenticated."
+  exit 1
+end

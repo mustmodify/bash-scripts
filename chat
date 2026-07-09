@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Usage: chat SENDER "message"
+# Usage: chat SENDER "line 1" "line 2" ...
+#
+# Posts a message to the shared agent chat log.
+# SENDER: DEV-1, DEV-2, IM, JW, SYSTEM, etc.
+#
+# Examples:
+#   chat JW "Hey agents, please rebase on develop"
+#   chat DEV-1 "Starting work on X" "No conflicts expected"
+
+set -euo pipefail
+
+CHAT="${HOME}/projects/earlyasset/ea-tools/chat.txt"
+LOCK=/tmp/ea-chat.lock
+
+if [ $# -lt 2 ]; then
+  echo "Usage: chat SENDER \"message\" [\"line 2\" ...]" >&2
+  exit 1
+fi
+
+SENDER="$1"
+shift
+
+TS=$(date "+%Y-%m-%d %H:%M:%S")
+PREFIX="[$TS] [$SENDER] "
+INDENT=$(printf "%${#PREFIX}s" "")
+
+# Build the lines to write, then atomic-append with flock
+LINES=""
+FIRST=1
+for msg in "$@"; do
+  if [ "$FIRST" = "1" ]; then
+    LINES="${PREFIX}${msg}"$'\n'
+    FIRST=0
+  else
+    LINES="${LINES}${INDENT}${msg}"$'\n'
+  fi
+done
+
+(
+  flock 9
+  printf '%s' "$LINES" >> "$CHAT"
+  LINE_COUNT=$(wc -l < "$CHAT")
+  if [ "$LINE_COUNT" -gt 500 ]; then
+    ARCHIVE="${HOME}/projects/earlyasset/ea-tools/chat.$(date "+%Y%m%d%H%M%S").txt"
+    mv "$CHAT" "$ARCHIVE"
+    echo "[$TS] [SYSTEM] Chat archived to $(basename "$ARCHIVE")" >> "$CHAT"
+  fi
+) 9>"$LOCK"

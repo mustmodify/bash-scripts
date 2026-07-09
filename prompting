@@ -1,0 +1,230 @@
+#!/bin/bash
+#
+# prompting — show which prompt files get @referenced into an agent's context.
+#
+# An agent's real context is the CASCADE: every CLAUDE.md from ~ down to the
+# agent's own directory. Shared ancestor levels are the "ALL AGENTS" part; the
+# agent's own CLAUDE.md is its section. A file pulled in more than once across
+# the cascade is flagged (dup).
+#
+#   prompting            full view — every discovered agent, grouped
+#   prompting im         only the cascade for the agent whose dir is named "im"
+#   prompting dev-1      likewise
+#
+# Optional: PROMPTING_SCOPE env var overrides the search root (default ~).
+
+SCOPE="${PROMPTING_SCOPE:-$HOME}"
+
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+CYAN='\033[36m'; YELLOW='\033[33m'; GREEN='\033[32m'; RED='\033[31m'
+
+rel() { echo "${1/#$HOME/\~}"; }
+
+# All CLAUDE.md files in scope (skip vcs / vendored / archived noise).
+mapfile -t CLAUDES < <(
+    find "$SCOPE" -name CLAUDE.md \
+        -not -path "*/.git/*" \
+        -not -path "*/node_modules/*" \
+        -not -path "*/_old*" \
+        -not -path "*/backup/*" \
+        2>/dev/null | sort
+)
+
+# Parallel array of their directories.
+CLAUDE_DIRS=()
+for c in "${CLAUDES[@]}"; do CLAUDE_DIRS+=("$(dirname "$c")"); done
+
+# --- helpers ---------------------------------------------------------------
+
+# Pull @-references from a file → absolute paths. Handles "Read @p", "* @p", "@p".
+extract_references() {
+    local file="$1"
+    [[ -f "$file" ]] || return
+    grep -E "^[[:space:]]*(Read @|\* @|@)" "$file" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*(Read @|\* @|@)//' \
+        | sed -E 's/[[:space:]].*$//' \
+        | sed "s|^~|$HOME|; s|^\$HOME|$HOME|"
+}
+
+# Recursively print a file and everything it references. Uses global `seen`.
+show_tree() {
+    local file="$1" indent="$2"
+    local name; name="$(basename "$file")"
+
+    local flag="" recurse=1
+    if [[ -n "${seen[$file]}" ]]; then
+        flag=" ${DIM}(dup)${RESET}"; recurse=0
+    elif [[ ! -f "$file" ]]; then
+        flag=" ${RED}(MISSING)${RESET}"; seen[$file]=1; recurse=0
+    else
+        seen[$file]=1
+    fi
+
+    echo -e "${indent}- ${CYAN}@$name${RESET}$flag"
+
+    if [[ $recurse -eq 1 ]]; then
+        local refs; refs="$(extract_references "$file")"
+        [[ -n "$refs" ]] || return
+        while IFS= read -r ref; do
+            show_tree "$ref" "  $indent"
+        done <<< "$refs"
+    fi
+}
+
+# Print one CLAUDE.md's reference tree (its refs are the top-level nodes).
+print_claude() {
+    local claude_file="$1"
+    local refs; refs="$(extract_references "$claude_file")"
+    if [[ -z "$refs" ]]; then
+        echo -e "  ${DIM}(no @-references)${RESET}"
+        return
+    fi
+    local base; base="$(dirname "$(echo "$refs" | head -1)")"
+    echo -e "  ${DIM}loads from $(rel "$base")${RESET}"
+    while IFS= read -r ref; do
+        show_tree "$ref" "  "
+    done <<< "$refs"
+}
+
+# Ancestor CLAUDE dirs of $1 (a dir), shallow → deep, including itself.
+ancestry_for() {
+    local target="$1" hits=()
+    local i
+    for i in "${!CLAUDE_DIRS[@]}"; do
+        local d="${CLAUDE_DIRS[$i]}"
+        if [[ "$target" == "$d" || "$target" == "$d"/* ]]; then
+            hits+=("$d")
+        fi
+    done
+    printf '%s\n' "${hits[@]}" | awk '{ print length, $0 }' | sort -n | cut -d' ' -f2-
+}
+
+# Map a dir back to its CLAUDE.md path.
+claude_at() { echo "$1/CLAUDE.md"; }
+
+# Render a full cascade for one agent dir: ancestors labelled ALL AGENTS,
+# the agent's own dir labelled by name. `seen` accumulates across the cascade.
+render_agent() {
+    local agent_dir="$1"
+    declare -gA seen=()
+    local chain; mapfile -t chain < <(ancestry_for "$agent_dir")
+    local d
+    for d in "${chain[@]}"; do
+        if [[ "$d" == "$agent_dir" ]]; then
+            echo -e "\n${BOLD}${GREEN}$(basename "$d")${RESET}  ${DIM}$(rel "$d")/CLAUDE.md${RESET}"
+        else
+            echo -e "\n${BOLD}${YELLOW}ALL AGENTS${RESET}  ${DIM}$(rel "$d")/CLAUDE.md${RESET}"
+        fi
+        print_claude "$(claude_at "$d")"
+    done
+}
+
+# --- named mode: prompting <name> -----------------------------------------
+
+if [[ -n "$1" ]]; then
+    want="$1"
+    matches=()
+    for d in "${CLAUDE_DIRS[@]}"; do
+        [[ "$(basename "$d")" == "$want" ]] && matches+=("$d")
+    done
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        echo -e "${RED}No agent directory named '$want' with a CLAUDE.md under $(rel "$SCOPE").${RESET}"
+        echo -e "${DIM}Known agents:${RESET}"
+        for d in "${CLAUDE_DIRS[@]}"; do
+            [[ -n "$(extract_references "$(claude_at "$d")")" ]] || continue
+            echo "  $(basename "$d")  ($(rel "$d"))"
+        done
+        exit 1
+    fi
+
+    for d in "${matches[@]}"; do
+        [[ ${#matches[@]} -gt 1 ]] && echo -e "${DIM}--- $(rel "$d") ---${RESET}"
+        render_agent "$d"
+    done
+    echo
+    exit 0
+fi
+
+# --- full mode: prompting -------------------------------------------------
+# An "agent" is a CLAUDE.md that actually @references something (app-code
+# CLAUDE.md files that are just inline docs have no refs — skip them). Group
+# agents that share their parent cascade AND their own refs (e.g. dev-1..5).
+
+echo -e "${BOLD}${YELLOW}Agent Prompt Loading Chain${RESET}  ${DIM}scope: $(rel "$SCOPE")${RESET}"
+echo    "==============================================================="
+
+# Two-level grouping:
+#   outer bucket = shared parent cascade (printed once as ALL AGENTS)
+#   inner group  = identical own-refs (collapses dev-1..5 into one row)
+# Ref-bearing CLAUDE dirs that are a strict ancestor of another such dir are
+# shared levels — they show only as ALL AGENTS, never as their own agent row.
+REF_DIRS=()
+for d in "${CLAUDE_DIRS[@]}"; do
+    [[ -n "$(extract_references "$(claude_at "$d")")" ]] && REF_DIRS+=("$d")
+done
+is_shared_ancestor() {
+    local a="$1" b
+    for b in "${REF_DIRS[@]}"; do
+        [[ "$b" != "$a" && "$b" == "$a"/* ]] && return 0
+    done
+    return 1
+}
+
+declare -A bucket_members=()  # parent-sig -> "dir|dir|..." (all agents in bucket)
+bucket_order=()
+
+for d in "${CLAUDE_DIRS[@]}"; do
+    own="$(extract_references "$(claude_at "$d")")"
+    [[ -n "$own" ]] || continue                     # no refs → not an agent
+    is_shared_ancestor "$d" && continue             # ancestor → ALL AGENTS only
+    psig="$(ancestry_for "$d" | grep -vxF "$d" | tr '\n' '>')"
+    psig="${psig:-<root>}"                          # empty key is illegal in bash
+    if [[ -z "${bucket_members[$psig]}" ]]; then
+        bucket_order+=("$psig")
+        bucket_members[$psig]="$d"
+    else
+        bucket_members[$psig]="${bucket_members[$psig]}|$d"
+    fi
+done
+
+for psig in "${bucket_order[@]}"; do
+    IFS='|' read -r -a members <<< "${bucket_members[$psig]}"
+
+    # Print the shared ancestor cascade ONCE, accumulating a root baseline.
+    declare -gA seen=()
+    if [[ "$psig" != "<root>" ]]; then
+        IFS='>' read -r -a parents <<< "$psig"
+        for p in "${parents[@]}"; do
+            [[ -n "$p" ]] || continue
+            echo -e "\n${BOLD}${YELLOW}ALL AGENTS${RESET}  ${DIM}$(rel "$p")/CLAUDE.md${RESET}"
+            print_claude "$(claude_at "$p")"
+        done
+    fi
+    declare -A root_seen=()
+    for k in "${!seen[@]}"; do root_seen[$k]=1; done
+
+    # Collapse siblings with identical own-refs, preserving encounter order.
+    declare -A sub_members=(); sub_order=()
+    for d in "${members[@]}"; do
+        own="$(extract_references "$(claude_at "$d")" | tr '\n' ',')"
+        if [[ -z "${sub_members[$own]}" ]]; then
+            sub_order+=("$own"); sub_members[$own]="$d"
+        else
+            sub_members[$own]="${sub_members[$own]}|$d"
+        fi
+    done
+
+    for own in "${sub_order[@]}"; do
+        IFS='|' read -r -a sibs <<< "${sub_members[$own]}"
+        names=""; for m in "${sibs[@]}"; do names+="$(basename "$m") "; done
+        rep="${sibs[0]}"
+
+        declare -gA seen=()
+        for k in "${!root_seen[@]}"; do seen[$k]=1; done
+
+        echo -e "\n${BOLD}${GREEN}${names% }${RESET}  ${DIM}$(rel "$rep")/CLAUDE.md${RESET}"
+        print_claude "$(claude_at "$rep")"
+    done
+done
+echo

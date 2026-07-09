@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# render-as — fetch HTML from a Rails app as if logged in as a specific user.
+# Boots Rails in-process via `bin/rails runner` and signs in via
+# Warden::Test::Helpers, so no running server, no cookies, no real password.
+#
+# Run from the Rails project root.
+#
+# Usage:
+#   render-as <user-email> <url> [params-json]
+#
+# Examples:
+#   render-as jw@earlyasset.com /admin/companies
+#   render-as jw@earlyasset.com /admin/companies '{"q":"plume"}'
+#
+# Body goes to stdout. HTTP status (and Location on redirect) go to stderr.
+
+set -eu
+
+if [ $# -lt 2 ]; then
+  echo "Usage: render-as <user-email> <url> [params-json]" >&2
+  exit 2
+fi
+
+if [ ! -x bin/rails ]; then
+  echo "render-as: bin/rails not found in $PWD — run from a Rails project root" >&2
+  exit 2
+fi
+
+export RENDER_AS_EMAIL=$1
+export RENDER_AS_URL=$2
+export RENDER_AS_PARAMS=${3:-'{}'}
+
+bin/rails runner - <<'RUBY'
+require "json"
+require "warden/test/helpers"
+
+Warden.test_mode!
+extend Warden::Test::Helpers
+
+email  = ENV.fetch("RENDER_AS_EMAIL")
+url    = ENV.fetch("RENDER_AS_URL")
+params = JSON.parse(ENV.fetch("RENDER_AS_PARAMS"))
+
+user = User.find_by(email: email)
+abort "render-as: no user with email #{email}" unless user
+
+login_as(user, scope: :user)
+
+session = ActionDispatch::Integration::Session.new(Rails.application)
+session.host = "localhost"
+session.get(url, params: params)
+
+warn "HTTP #{session.response.status}"
+warn "Location: #{session.response.location}" if session.response.redirect?
+puts session.response.body
+RUBY

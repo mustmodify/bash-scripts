@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# pr-feedback — CodeRabbit review body, general comments, and inline comments for a PR.
+# Usage: pr-feedback <pr-number>
+set -euo pipefail
+
+N=${1:?usage: pr-feedback <pr-number>}
+REPO=EarlyAsset/earlyasset
+
+echo "=== CodeRabbit reviews on #$N ==="
+gh pr view "$N" -R "$REPO" --json reviews \
+  --jq '.reviews[] | select(.author.login=="coderabbitai") | "---\n[\(.submittedAt)] \(.state)\n\(.body)\n"'
+
+echo
+echo "=== CodeRabbit general comments on #$N ==="
+gh pr view "$N" -R "$REPO" --json comments \
+  --jq '.comments[] | select(.author.login=="coderabbitai") | "---\n[\(.createdAt)]\n\(.body)\n"'
+
+echo
+echo "=== Inline comments on #$N ==="
+gh api "repos/$REPO/pulls/$N/comments" \
+  --jq '.[] | select(.user.login=="coderabbitai") | "---\n[\(.created_at)] \(.path):\(.line)\n\(.body)\n"'

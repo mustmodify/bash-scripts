@@ -1,61 +1,129 @@
 #!/bin/bash
 
-# --- Configuration ---
-TARGET_BRANCH="develop"
-# ---------------------
+# Clean stale local git branches.
+#
+# Uses `git diff origin/develop...BRANCH` to detect branches whose changes
+# are already in develop (works with squash merge, unlike `git branch --merged`).
+#
+# Flags:
+#   -ai       Structured JSON output for AI agents
+#   --dry-run List what would be deleted without deleting
+#   --force   Delete without confirmation prompt
+#
+# Protected: develop, main, current branch (*), worktree branches (+)
 
-# Function to display messages
-log() {
-    echo -e "\n\033[1m$1\033[0m" # Bold text
-}
+set -e
 
-# Function to check if a branch is fully merged into the target branch
-# This works for both traditional merges and squash merges.
-is_merged() {
-    local branch_name="$1"
-    # Use --no-merged and grep -q to check if the branch is *not* in the list of unmerged branches.
-    # If it's not in the unmerged list, it is considered merged.
-    git branch --no-merged "$TARGET_BRANCH" | grep -q "^  $branch_name$"
-    # The return value of the grep command determines the function's return code.
-    # If grep finds the branch (it is *not* merged), it returns 0.
-    # We want to know if it IS merged, so we negate the result.
-    [ $? -ne 0 ]
-}
+AI_MODE=""
+DRY_RUN=""
+FORCE=""
+TARGET="develop"
 
-# 1. Update the local repository
-log "🔄 Fetching the latest changes from all remotes..."
-git fetch --all --prune
-
-# 2. Switch to the target branch and pull the latest changes
-log "🎯 Checking out and updating the $TARGET_BRANCH branch..."
-git checkout "$TARGET_BRANCH"
-git pull origin "$TARGET_BRANCH"
-
-# 3. Get a list of all local branches, excluding the target and main branches
-log "🔍 Identifying branches merged into $TARGET_BRANCH..."
-# The main branch is often 'master' or 'main', so we include it in the exclusions just in case.
-# We also want to exclude the current working branch, which is $TARGET_BRANCH.
-EXCLUSIONS=("$TARGET_BRANCH" "master" "main")
-
-# Get a list of all local branches except the exclusions
-ALL_BRANCHES=$(git branch --format='%(refname:short)' | grep -v -E "$(IFS='|'; echo "${EXCLUSIONS[*]}")")
-
-DELETED_COUNT=0
-
-# 4. Loop through the branches and delete merged ones
-for branch in $ALL_BRANCHES; do
-    if is_merged "$branch"; then
-        log "✅ Deleting merged branch: $branch"
-        git branch -d "$branch"
-        if [ $? -eq 0 ]; then
-            DELETED_COUNT=$((DELETED_COUNT + 1))
-        fi
-    else
-        echo "➡️ Keeping unmerged branch: $branch"
-    fi
+for arg in "$@"; do
+  case "$arg" in
+    -ai) AI_MODE="1" ;;
+    --dry-run) DRY_RUN="1" ;;
+    --force) FORCE="1" ;;
+  esac
 done
 
-# 5. Final summary
-log "🎉 Cleanup complete!"
-echo "Total branches deleted: $DELETED_COUNT"
-echo "You are currently on the **$TARGET_BRANCH** branch."
+git fetch origin "$TARGET" --quiet 2>/dev/null
+
+# Get protected branches: current (*), worktree (+), develop, main
+PROTECTED=$(git branch | grep -E '^\*|^\+' | sed 's/^[* +]*//' | tr '\n' '|')
+PROTECTED="${PROTECTED}develop|main"
+
+EMPTY=()
+TRIVIAL=()
+ACTIVE=()
+
+for branch in $(git branch | grep -v -E '^\*|^\+' | sed 's/^ *//' | grep -v -E "^(develop|main)$"); do
+  files_changed=$(git diff "origin/$TARGET...$branch" --stat 2>/dev/null | grep -oE "^[[:space:]]*[0-9]+" | tr -d ' ' || echo "ERR")
+  [ -z "$files_changed" ] && files_changed=0
+  [ "$files_changed" = "ERR" ] && files_changed=0
+
+  age=$(git log -1 --format="%cr" "$branch" 2>/dev/null)
+  has_remote="no"
+  git branch -r 2>/dev/null | grep -qw "origin/$branch" && has_remote="yes"
+
+  if [ "$files_changed" -eq 0 ]; then
+    EMPTY+=("$branch|$age|$has_remote")
+  elif [ "$files_changed" -le 3 ]; then
+    TRIVIAL+=("$branch|${files_changed} files|$age|$has_remote")
+  else
+    ACTIVE+=("$branch|${files_changed} files|$age|$has_remote")
+  fi
+done
+
+if [ -n "$AI_MODE" ]; then
+  # JSON output
+  json_array() {
+    local arr=("$@")
+    echo -n "["
+    for i in "${!arr[@]}"; do
+      IFS='|' read -r name detail age remote <<< "${arr[$i]}"
+      [ $i -gt 0 ] && echo -n ","
+      echo -n "{\"branch\":\"$name\",\"detail\":\"$detail\",\"age\":\"$age\",\"remote\":\"$remote\"}"
+    done
+    echo -n "]"
+  }
+
+  echo -n "{\"empty_diff\":"
+  json_array "${EMPTY[@]}"
+  echo -n ",\"trivial\":"
+  json_array "${TRIVIAL[@]}"
+  echo -n ",\"active\":"
+  json_array "${ACTIVE[@]}"
+  echo "}"
+else
+  echo ""
+  echo "=== Empty diff vs develop (safe to delete) ==="
+  if [ ${#EMPTY[@]} -eq 0 ]; then
+    echo "  (none)"
+  else
+    printf "  %-45s %-20s %s\n" "BRANCH" "AGE" "REMOTE"
+    for entry in "${EMPTY[@]}"; do
+      IFS='|' read -r name age remote <<< "$entry"
+      printf "  %-45s %-20s %s\n" "$name" "$age" "$remote"
+    done
+  fi
+
+  echo ""
+  echo "=== Trivial diff (<=3 files) ==="
+  if [ ${#TRIVIAL[@]} -eq 0 ]; then
+    echo "  (none)"
+  else
+    printf "  %-45s %-12s %-20s %s\n" "BRANCH" "DIFF" "AGE" "REMOTE"
+    for entry in "${TRIVIAL[@]}"; do
+      IFS='|' read -r name diff age remote <<< "$entry"
+      printf "  %-45s %-12s %-20s %s\n" "$name" "$diff" "$age" "$remote"
+    done
+  fi
+
+  echo ""
+  echo "=== Active work ==="
+  if [ ${#ACTIVE[@]} -eq 0 ]; then
+    echo "  (none)"
+  else
+    printf "  %-45s %-12s %-20s %s\n" "BRANCH" "DIFF" "AGE" "REMOTE"
+    for entry in "${ACTIVE[@]}"; do
+      IFS='|' read -r name diff age remote <<< "$entry"
+      printf "  %-45s %-12s %-20s %s\n" "$name" "$diff" "$age" "$remote"
+    done
+  fi
+fi
+
+# Delete empty-diff branches
+if [ ${#EMPTY[@]} -gt 0 ] && [ -z "$DRY_RUN" ]; then
+  if [ -z "$FORCE" ] && [ -z "$AI_MODE" ]; then
+    echo ""
+    read -p "Delete ${#EMPTY[@]} empty-diff branches? [y/N] " confirm
+    [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && exit 0
+  fi
+
+  for entry in "${EMPTY[@]}"; do
+    IFS='|' read -r name _ _ <<< "$entry"
+    git branch -D "$name" 2>/dev/null
+    [ -z "$AI_MODE" ] && echo "  Deleted: $name"
+  done
+fi

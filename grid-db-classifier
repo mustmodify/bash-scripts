@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# grid-db-classifier — PreToolUse hook for Claude Code Bash invocations.
+#
+# Layer 2 of the DB-class STOP rail (Layer 1 lives in ~/.claude/settings.json
+# permissions.deny). Inspects Bash command bodies for patterns the deny list
+# can't see because they hide inside a script body (Ruby one-liners, raw psql
+# args, ActiveRecord::Migration direct calls, mid-rename merges).
+#
+# Spec: when one of the patterns below matches, exit 2 with a structured
+# stderr message explaining (a) what we matched, (b) the rule, (c) the
+# required surface (question_create or send to dispatcher/principal), and
+# (d) the bypass (set GRID_DB_FIX_AUTHORIZED in the calling env after a
+# principal explicitly clears the op).
+#
+# Input contract (Claude Code PreToolUse hook): JSON on stdin with shape
+#   { "tool_name": "Bash", "tool_input": { "command": "..." } }
+# Output contract: exit 0 (allow) or exit 2 with message on stderr (block).
+#
+# Bypass: if GRID_DB_FIX_AUTHORIZED is set in the caller's env, the hook
+# logs the bypass to ~/.claude/grid-db-bypass.log and exits 0. The dev sets
+# this AFTER they've surfaced the operation and a principal has acked.
+#
+# Designed 2026-06-17 after the dev-3 PR #3297 incident — see
+# ea-docs parts/when-stuck.md.
+
+set -u
+
+# Read full stdin payload
+PAYLOAD=$(cat)
+
+# Extract tool_name and command (jq if available, fallback to grep)
+if command -v jq >/dev/null 2>&1; then
+  TOOL_NAME=$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty')
+  CMD=$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // empty')
+else
+  TOOL_NAME=$(printf '%s' "$PAYLOAD" | grep -oP '"tool_name"\s*:\s*"\K[^"]+' | head -1)
+  CMD=$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("tool_input",{}).get("command",""))' 2>/dev/null)
+fi
+
+# Only inspect Bash invocations
+if [ "$TOOL_NAME" != "Bash" ]; then
+  exit 0
+fi
+
+# Empty command — nothing to do
+if [ -z "$CMD" ]; then
+  exit 0
+fi
+
+# Bypass: principal has explicitly cleared this dev session for a DB op.
+# Log every use so the audit trail exists even when bypass is benign.
+if [ -n "${GRID_DB_FIX_AUTHORIZED:-}" ]; then
+  mkdir -p "$HOME/.claude"
+  printf '%s\tGRID_DB_FIX_AUTHORIZED=%s\tcmd=%s\n' \
+    "$(date -Iseconds)" "$GRID_DB_FIX_AUTHORIZED" "$CMD" \
+    >> "$HOME/.claude/grid-db-bypass.log"
+  exit 0
+fi
+
+block() {
+  local pattern="$1"
+  local rule="$2"
+  cat >&2 <<EOF
+🛑 grid-db-classifier: DB-class STOP triggered.
+
+Matched: $pattern
+Rule: $rule
+
+This is a discrete-STOP, not a friction prompt. Surface before acting:
+
+  1. Diagnose the underlying problem in one line.
+  2. List 2-3 candidate fixes with their reversibility cost.
+  3. Pick one and explain why; flag the risk.
+  4. send() to dispatcher OR a principal, OR question_create to JW,
+     using the template:
+
+       "PR/issue #N: <diagnosis>. Proposed action: <one line>.
+        Reversibility: <30s | hard>. OK to proceed, or do you want
+        to handle?"
+
+  5. Wait for the principal/JW ack. They may pick differently, or
+     handle it themselves.
+
+If the principal has explicitly cleared this specific op, set
+GRID_DB_FIX_AUTHORIZED=<arc-id-or-ticket-ref> in your shell and retry.
+The bypass is logged to ~/.claude/grid-db-bypass.log for audit.
+
+See ea-docs parts/when-stuck.md for the full STOP/Refresh framework.
+EOF
+  exit 2
+}
+
+# Pattern 1: Ruby one-liner via `bundle exec ruby -e` or `rails runner -e`
+# that writes to AR (save!/update!/create!/destroy!/etc).
+if printf '%s' "$CMD" | grep -qE '(bundle exec ruby[[:space:]]+-e|bin/rails[[:space:]]+runner[[:space:]]+-e|rails[[:space:]]+runner[[:space:]]+-e)'; then
+  if printf '%s' "$CMD" | grep -qE '\.(save|update|create|destroy|delete|update_columns|update_all|delete_all|find_or_create_by|first_or_create|update_attribute)[!?]?\('; then
+    block 'Ruby one-liner with ActiveRecord write methods' \
+          'Inline Ruby with write-y AR calls bypasses code review + leaves no diff. Move the change to a migration, a rake task, or a tracked script — not a one-liner.'
+  fi
+fi
+
+# Pattern 2: raw psql / mysql against a rails DB.
+if printf '%s' "$CMD" | grep -qE '\b(psql|mysql|pg_dump|pg_restore|mysqldump)\b'; then
+  if printf '%s' "$CMD" | grep -qE '(_development|_production|_test|-d[[:space:]]+\w+|--dbname[[:space:]]*=?[[:space:]]*\w+)'; then
+    block 'Raw psql/mysql against a Rails-named database' \
+          'Direct SQL bypasses ActiveRecord callbacks, validations, and the migration history. Use a runner with the model layer, or a tracked migration.'
+  fi
+fi
+
+# Pattern 3: ActiveRecord::Migration[..].migrate(:up|:down) direct call.
+if printf '%s' "$CMD" | grep -qE 'ActiveRecord::Migration(\[[^]]+\])?\.[a-zA-Z_]*\bmigrate\(:(up|down)'; then
+  block 'ActiveRecord::Migration.migrate(:up|:down) direct invocation' \
+        'Running migrations outside the rake/rails db:migrate flow bypasses schema_migrations bookkeeping. Use the standard task or surface a structural problem.'
+fi
+
+# Pattern 4: git merge while db/migrate has unstaged changes (the dev-3
+# pattern). Best-effort heuristic; runs only if we're inside a git repo.
+if printf '%s' "$CMD" | grep -qE '^(\s*)git\s+merge\b'; then
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$REPO_ROOT" ] && [ -d "$REPO_ROOT/db/migrate" ]; then
+    DIRTY=$(cd "$REPO_ROOT" && git diff --name-only HEAD -- db/migrate 2>/dev/null | head -1)
+    if [ -n "$DIRTY" ]; then
+      block "git merge with uncommitted changes under db/migrate ($DIRTY)" \
+            'Merging while a migration is mid-rename produces a divergent schema_migrations history. Commit or stash the migration change first, OR surface the underlying collision.'
+    fi
+  fi
+fi
+
+# No patterns matched — allow.
+exit 0

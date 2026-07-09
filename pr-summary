@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# pr-summary — One-line-per-PR snapshot for /pr planning. Tab-separated.
+# Usage:
+#   pr-summary        # open PRs (all authors)
+#   pr-summary -a     # include recently closed (last 14 days)
+# Columns: number  author  state  CI=Xf/Yt  merge=…  review=…  branch  title
+set -euo pipefail
+
+REPO=EarlyAsset/earlyasset
+
+if [[ "${1:-}" == "-a" ]]; then
+  SINCE=$(date -d "14 days ago" +%Y-%m-%d)
+  filter_args=(--state all --search "updated:>=$SINCE" --limit 200)
+else
+  filter_args=(--state open --limit 100)
+fi
+
+gh pr list -R "$REPO" "${filter_args[@]}" \
+  --json number,headRefName,author,mergeStateStatus,reviewDecision,state,statusCheckRollup,title \
+  --jq '
+    def ci_summary:
+      ([.statusCheckRollup[] | select(.conclusion == "FAILURE")] | length) as $f
+      | (.statusCheckRollup | length) as $t
+      | "\($f)F/\($t)";
+    .[] |
+    "\(.number)\t\(.author.login)\t\(.state)\tCI=\(. | ci_summary)\tmerge=\(.mergeStateStatus)\treview=\(if (.reviewDecision // "") == "" then "-" else .reviewDecision end)\t\(.headRefName)\t\(.title)"
+  '

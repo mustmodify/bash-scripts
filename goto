@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# goto — resolve a short workspace alias to an absolute directory path.
+#
+# Prints the resolved path to stdout (so a shell wrapper can `cd` into it),
+# or an error to stderr and exits non-zero on an unknown / missing target.
+#
+# A plain script cannot change the calling shell's directory, so this only
+# RESOLVES the path. The `goto` shell function in ~/.bashrc does the cd:
+#     goto() { local d; d="$(command goto "$@")" && cd "$d"; }
+#
+# Usage: goto <alias>
+#   io | io-tower            -> ~/projects/earlyasset/io-tower
+#   tron                     -> ~/projects/tron/agents/tron
+#   docs | ea-docs           -> ~/projects/earlyasset/ea-docs
+#   dev-1..dev-5 | d1..d5 | 1..5 |
+#   im | main |
+#   dispatcher | dispatch    -> ~/projects/earlyasset/ea-agents/<name>
+
+set -euo pipefail
+
+ea="$HOME/projects/earlyasset"
+
+usage() {
+  echo "usage: goto <alias>  (io, tron, docs, dev-N, im, main, dispatcher)" >&2
+}
+
+if [ $# -ne 1 ]; then
+  usage
+  exit 2
+fi
+
+case "$1" in
+  io | io-tower)        target="$ea/io-tower" ;;
+  tron)                 target="$HOME/projects/tron/agents/tron" ;;
+  docs | ea-docs)       target="$ea/ea-docs" ;;
+  dispatch | dispatcher) target="$ea/ea-agents/dispatcher" ;;
+  dev-[1-9] | im | main) target="$ea/ea-agents/$1" ;;
+  d[1-9])               target="$ea/ea-agents/dev-${1#d}" ;;
+  [1-9])                target="$ea/ea-agents/dev-$1" ;;
+  *)
+    echo "goto: unknown alias '$1'" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+if [ ! -d "$target" ]; then
+  echo "goto: target directory does not exist: $target" >&2
+  exit 1
+fi
+
+printf '%s\n' "$target"

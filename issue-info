@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# issue-info: Show full details for a GitHub issue
+# Usage: issue-info <issue-number>
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: issue-info <issue-number>" >&2
+  exit 1
+fi
+
+issue_num="$1"
+
+# Fetch issue details
+issue_data=$(gh issue view "$issue_num" --repo earlyasset/earlyasset --json number,title,body,state,createdAt,author,comments)
+
+# Parse and format
+echo "$issue_data" | jq -r '
+"# Issue #\(.number): \(.title)",
+"",
+"Status: \(.state)",
+"Created: \(.createdAt)",
+"Author: \(.author.login)",
+"",
+"## Description",
+"",
+(.body // "(no description)"),
+"",
+(if (.comments | length) > 0 then
+  "## Comments (\(.comments | length))",
+  "",
+  (.comments | map(
+    "### \(.author.login) - \(.createdAt)",
+    "",
+    .body,
+    ""
+  ) | join("\n"))
+else
+  "## Comments",
+  "",
+  "(no comments)"
+end)
+'
+
+# Check for linked issues (parent/child relationships)
+# Look for "Closes #X", "Fixes #Y", etc. in body and comments
+echo ""
+echo "## Linked Issues"
+echo ""
+
+linked=$(echo "$issue_data" | jq -r '
+  [.body, (.comments[].body // "")]
+  | join("\n")
+  | scan("#[0-9]+")
+  | unique
+  | .[]
+' 2>/dev/null || true)
+
+if [[ -n "$linked" ]]; then
+  echo "$linked" | while read -r ref; do
+    echo "- $ref"
+  done
+else
+  echo "(no linked issues found)"
+fi

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# inclined - Drive a Cline agent from the command line with file I/O
+#
+# Reads a prompt from a message file, sends it to Cline (with full tool access),
+# and writes the agent's completion result to an output file.
+#
+# Usage:
+#   inclined -mf prompt.txt -of result.md
+#   inclined -mf prompt.txt -of result.md -m claude-sonnet-4-5-20250929
+#   inclined -mf prompt.txt -of result.md -c /path/to/project --json
+#   inclined -mf prompt.txt                    # stdout only, no output file
+#   echo "fix the tests" | inclined -of out.md # read prompt from stdin
+#
+# Options:
+#   -mf, --message-file <path>   File containing the prompt (reads stdin if omitted and stdin is piped)
+#   -of, --output-file <path>    File to write the result to (also prints to stdout if used)
+#   -m,  --model <model>         Model override (e.g. claude-sonnet-4-5-20250929)
+#   -c,  --cwd <path>            Working directory for the agent
+#   -t,  --timeout <seconds>     Timeout in seconds
+#   --json                       Output all messages as JSON lines
+#   --verbose                    Show verbose progress on stderr
+#   --thinking [tokens]          Enable extended thinking
+#   --config <path>              Custom cline config directory
+#   -T,  --task-id <id>          Resume an existing task (multi-turn conversation)
+#   --dry-run                    Show the cline command that would be run, don't execute
+#   -h,  --help                  Show this help
+#
+# The agent runs with --yolo (auto-approve all actions). It has full access to
+# the local environment: file system, terminal, browser, MCP servers, etc.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Defaults
+MESSAGE_FILE=""
+OUTPUT_FILE=""
+MODEL=""
+CWD=""
+TIMEOUT=""
+JSON_FLAG=""
+VERBOSE_FLAG=""
+THINKING_FLAG=""
+CONFIG_FLAG=""
+TASK_ID=""
+DRY_RUN=false
+
+usage() {
+  sed -n '/^# Usage:/,/^# The agent/p' "$0" | sed 's/^# \?//'
+  echo ""
+  echo "Examples:"
+  echo "  inclined -mf task.txt -of result.md"
+  echo "  inclined -mf task.txt -of result.md -m claude-sonnet-4-5-20250929 -t 300"
+  echo "  cat spec.md | inclined -of implementation_notes.md"
+  echo "  inclined -mf task.txt  # just print to stdout"
+  echo ""
+  echo "Under the hood, this calls:  cline -y [flags] \"<prompt>\""
+  echo "See 'cline --help' for full cline documentation."
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -mf|--message-file)
+      MESSAGE_FILE="$2"; shift 2 ;;
+    -of|--output-file)
+      OUTPUT_FILE="$2"; shift 2 ;;
+    -m|--model)
+      MODEL="$2"; shift 2 ;;
+    -c|--cwd)
+      CWD="$2"; shift 2 ;;
+    -t|--timeout)
+      TIMEOUT="$2"; shift 2 ;;
+    --json)
+      JSON_FLAG="--json"; shift ;;
+    --verbose|-v)
+      VERBOSE_FLAG="-v"; shift ;;
+    --thinking)
+      if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then
+        THINKING_FLAG="--thinking $2"; shift 2
+      else
+        THINKING_FLAG="--thinking"; shift
+      fi
+      ;;
+    --config)
+      CONFIG_FLAG="--config $2"; shift 2 ;;
+    -T|--task-id)
+      TASK_ID="$2"; shift 2 ;;
+    --dry-run)
+      DRY_RUN=true; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --version)
+      echo "inclined $VERSION"; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+# Read prompt: from message file, or from stdin if piped
+PROMPT=""
+if [[ -n "$MESSAGE_FILE" ]]; then
+  if [[ ! -f "$MESSAGE_FILE" ]]; then
+    echo "Error: Message file not found: $MESSAGE_FILE" >&2
+    exit 1
+  fi
+  PROMPT="$(cat "$MESSAGE_FILE")"
+elif [[ ! -t 0 ]]; then
+  # stdin is piped
+  PROMPT="$(cat)"
+else
+  echo "Error: No message file (-mf) provided and stdin is not piped." >&2
+  echo "Usage: inclined -mf prompt.txt -of result.md" >&2
+  exit 1
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Error: Prompt is empty." >&2
+  exit 1
+fi
+
+# Build the cline command
+CMD=(cline -y)
+[[ -n "$MODEL" ]]         && CMD+=(-m "$MODEL")
+[[ -n "$CWD" ]]           && CMD+=(-c "$CWD")
+[[ -n "$TIMEOUT" ]]       && CMD+=(-t "$TIMEOUT")
+[[ -n "$JSON_FLAG" ]]     && CMD+=($JSON_FLAG)
+[[ -n "$VERBOSE_FLAG" ]]  && CMD+=($VERBOSE_FLAG)
+[[ -n "$THINKING_FLAG" ]] && CMD+=($THINKING_FLAG)
+[[ -n "$CONFIG_FLAG" ]]   && CMD+=($CONFIG_FLAG)
+[[ -n "$TASK_ID" ]]       && CMD+=(-T "$TASK_ID")
+CMD+=("$PROMPT")
+
+if $DRY_RUN; then
+  echo "Would run:" >&2
+  printf '%q ' "${CMD[@]}"
+  echo ""
+  exit 0
+fi
+
+# Execute and capture output
+if [[ -n "$OUTPUT_FILE" ]]; then
+  # Run cline, tee to output file AND stdout
+  "${CMD[@]}" | tee "$OUTPUT_FILE"
+  EXIT_CODE=${PIPESTATUS[0]}
+else
+  # No output file, just run to stdout
+  "${CMD[@]}"
+  EXIT_CODE=$?
+fi
+
+exit $EXIT_CODE

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# pr-list — JSON dump of jw's EarlyAsset PRs active in the last N days (default 14). Covers open + recently closed/merged.
+# Usage: pr-list [days]
+set -euo pipefail
+
+DAYS=${1:-14}
+REPO=EarlyAsset/earlyasset
+SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d)
+
+gh pr list -R "$REPO" \
+  --author @me \
+  --state all \
+  --search "updated:>=$SINCE" \
+  --limit 200 \
+  --json number,title,headRefName,state,isDraft,mergeStateStatus,statusCheckRollup,reviewDecision,updatedAt,mergedAt,closedAt,url

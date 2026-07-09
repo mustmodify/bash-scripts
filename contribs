@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# contribs - Show lines of code contributed by each author in a git repository
+
+# Get list of all files tracked by git, excluding .gitignore and db/ folder
+files=$(git ls-files | grep -v '\.gitignore$' | grep -v '^db/')
+
+# Check if there are any files
+if [ -z "$files" ]; then
+    echo "No files found in git repository"
+    exit 1
+fi
+
+# Create temporary file for storing results
+temp_file=$(mktemp)
+
+# For each file, use git blame to count non-empty lines per author
+echo "$files" | while IFS= read -r file; do
+    if [ -f "$file" ]; then
+        # Skip binary files
+        if file -b --mime "$file" | grep -q "charset=binary"; then
+            continue
+        fi
+        
+        # Use git blame with -w (ignore whitespace) and filter out empty lines
+        git blame -w --line-porcelain "$file" 2>/dev/null | \
+            grep "^author " | \
+            sed 's/^author //'
+    fi
+done | sort | uniq -c | sort -rn > "$temp_file"
+
+# Display results
+echo "Lines of code by contributor (excluding whitespace and db/ folder):"
+echo "===================================================================="
+printf "%-10s %s\n" "Lines" "Author"
+echo "--------------------------------------------------------------------"
+
+total=0
+while IFS= read -r line; do
+    count=$(echo "$line" | awk '{print $1}')
+    author=$(echo "$line" | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')
+    printf "%-10s %s\n" "$count" "$author"
+    total=$((total + count))
+done < "$temp_file"
+
+echo "--------------------------------------------------------------------"
+printf "%-10s %s\n" "$total" "TOTAL"
+
+# Cleanup
+rm -f "$temp_file"

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Usage: chat-recent [N]
+# Print the N most recent messages from the shared agent chat log.
+# Defaults to 5. A "message" is a `[YYYY-MM-DD HH:MM:SS] [SENDER] ...` block
+# plus any continuation lines until the next bracketed timestamp.
+#
+# Pair with ~/bin/chat for writing.
+
+set -euo pipefail
+
+N="${1:-5}"
+CHAT="${HOME}/projects/earlyasset/ea-tools/chat.txt"
+
+if [ ! -f "$CHAT" ]; then
+  echo "chat-recent: $CHAT not found" >&2
+  exit 1
+fi
+
+# Line numbers where messages start (lines beginning with `[YYYY-`).
+START=$(grep -nE '^\[[0-9]{4}-' "$CHAT" | tail -n "$N" | head -n 1 | cut -d: -f1)
+
+if [ -z "$START" ]; then
+  exit 0
+fi
+
+sed -n "${START},\$p" "$CHAT"

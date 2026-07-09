@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Launch or resume a Claude Code agent in the current directory,
+# wired up to tron-control via the tron-channel MCP server.
+#
+#   agent              resume latest session (or start fresh if none)
+#   agent r|resume     same
+#   agent n|new        start a fresh session (ignores prior)
+#   agent restart      kill any existing TUI in this cwd, then resume
+#   agent status       show session info + running-TUI state
+
+set -u
+
+cmd=${1:-resume}
+dir=$(pwd -P)
+basename=$(basename "$dir")
+# Normalize underscores to hyphens so socket + session names match the
+# agent-* convention used by cline worktrees (agent-1, happy-thoughts, etc.).
+agent_id=${basename//_/-}
+
+# Claude's session-dir slug replaces both `/` and `_` with `-`.
+slug="-${dir//\//-}"
+slug="${slug#-}"
+slug="${slug//_/-}"
+projects_dir="$HOME/.claude/projects/$slug"
+
+mcp_path="$HOME/projects/mustmodify/ai-tools/tron-channel-mcp.js"
+
+find_latest_session() {
+  [ -d "$projects_dir" ] || return 1
+  local f
+  f=$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)
+  [ -n "$f" ] && echo "$f"
+}
+
+find_running_pid() {
+  for pid_dir in /proc/[0-9]*; do
+    pid=$(basename "$pid_dir")
+    target=$(readlink "$pid_dir/cwd" 2>/dev/null) || continue
+    [ "$target" = "$dir" ] || continue
+    comm=$(cat "$pid_dir/comm" 2>/dev/null) || continue
+    [ "$comm" = "claude" ] && echo "$pid" && return 0
+  done
+  return 1
+}
+
+ensure_mcp_config() {
+  # We OWN the tron-channel server entry — reconcile it every launch.
+  # Why reconcile, not just "create if missing": worktrees branched from
+  # another agent inherit the parent's .mcp.json verbatim, so TRON_AGENT_NAME
+  # stays wrong (e.g. grid-dev-1 was registering as "tron", stomping the
+  # principal's socket and leaving its own /tmp/tron-channel-grid-dev-1.sock
+  # unbound, which then hid the chat input on the Grid dashboard).
+  # Other mcpServers entries (user-owned) are preserved.
+  local file="$dir/.mcp.json"
+  local desired
+  desired=$(jq -n \
+    --arg cmd "node" \
+    --arg arg "$mcp_path" \
+    --arg name "$agent_id" \
+    '{command: $cmd, args: [$arg], env: {TRON_AGENT_NAME: $name}}')
+
+  if [ ! -f "$file" ]; then
+    jq -n --argjson tc "$desired" '{mcpServers: {"tron-channel": $tc}}' > "$file"
+    echo "[agent] created $file (TRON_AGENT_NAME=$agent_id)"
+    return 0
+  fi
+
+  local current
+  current=$(jq -c '.mcpServers["tron-channel"] // null' "$file" 2>/dev/null) || current="null"
+  if [ "$current" = "$(jq -c . <<<"$desired")" ]; then
+    return 0
+  fi
+
+  local tmp="$file.tmp.$$"
+  jq --argjson tc "$desired" '.mcpServers["tron-channel"] = $tc' "$file" > "$tmp" && mv "$tmp" "$file"
+  echo "[agent] reconciled $file (TRON_AGENT_NAME=$agent_id)"
+}
+
+launch() {
+  local uuid=${1:-}
+  local args=(
+    --permission-mode auto
+    --add-dir "$HOME/projects/earlyasset/ea-docs"
+    --dangerously-load-development-channels server:tron-channel
+  )
+  if [ -n "$uuid" ]; then
+    args=(--resume "$uuid" "${args[@]}")
+    echo "[agent] resuming $uuid"
+  else
+    echo "[agent] starting new session"
+  fi
+  exec claude "${args[@]}"
+}
+
+case "$cmd" in
+  r) cmd=resume ;;
+  n) cmd=new ;;
+esac
+
+case "$cmd" in
+  resume|"")
+    ensure_mcp_config
+    pid=$(find_running_pid) || true
+    if [ -n "${pid:-}" ]; then
+      echo "[agent] already running (PID $pid). Use 'agent restart' to replace."
+      exit 1
+    fi
+    latest=$(find_latest_session) || true
+    if [ -n "${latest:-}" ]; then
+      launch "$(basename "$latest" .jsonl)"
+    else
+      launch
+    fi
+    ;;
+
+  new)
+    ensure_mcp_config
+    pid=$(find_running_pid) || true
+    if [ -n "${pid:-}" ]; then
+      echo "[agent] already running (PID $pid). Kill it first or use 'agent restart'."
+      exit 1
+    fi
+    launch
+    ;;
+
+  restart)
+    ensure_mcp_config
+    pid=$(find_running_pid) || true
+    if [ -n "${pid:-}" ]; then
+      echo "[agent] killing existing PID $pid"
+      kill "$pid" 2>/dev/null || true
+      # Wait up to 5s for it to exit.
+      for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+      done
+    fi
+    latest=$(find_latest_session) || true
+    if [ -n "${latest:-}" ]; then
+      launch "$(basename "$latest" .jsonl)"
+    else
+      launch
+    fi
+    ;;
+
+  status)
+    echo "dir:          $dir"
+    echo "agent id:     $agent_id"
+    echo "sessions dir: $projects_dir"
+    latest=$(find_latest_session) || true
+    if [ -n "${latest:-}" ]; then
+      echo "latest:       $(basename "$latest" .jsonl)"
+      echo "  modified:   $(stat -c %y "$latest")"
+    else
+      echo "latest:       (none)"
+    fi
+    pid=$(find_running_pid) || true
+    if [ -n "${pid:-}" ]; then
+      echo "running:      PID $pid"
+    else
+      echo "running:      no"
+    fi
+    sock="/tmp/tron-channel-$agent_id.sock"
+    if [ -S "$sock" ]; then
+      echo "channel:      $sock (up)"
+    else
+      echo "channel:      $sock (down)"
+    fi
+    ;;
+
+  *)
+    echo "Usage: agent [r|resume|n|new|restart|status]" >&2
+    exit 2
+    ;;
+esac
