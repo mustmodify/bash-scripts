@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: chat SENDER "message"
 # Usage: chat SENDER "line 1" "line 2" ...
+# Usage: chat SENDER   (message read from stdin instead -- see note below)
 #
 # Posts a message to the shared agent chat log.
 # SENDER: DEV-1, DEV-2, IM, JW, SYSTEM, etc.
@@ -8,19 +9,43 @@
 # Examples:
 #   chat JW "Hey agents, please rebase on develop"
 #   chat DEV-1 "Starting work on X" "No conflicts expected"
+#   printf 'a line with a literal `backtick` in it\n' | chat DEV-1
+#
+# Security note: a message passed as a shell argument is only as safe as its
+# own quoting. `chat DEV-1 "$msg"` with $msg containing backticks/$() is a
+# command injection -- the OUTER shell parses and executes that BEFORE this
+# script ever runs; nothing in here can defend against it after the fact.
+# If a message might contain content you didn't type yourself (relayed
+# Slack/GitHub text, etc.), pipe it in via stdin instead: stdin bytes are
+# never re-parsed for command substitution, so backticks/$() in them are
+# just literal characters.
 
 set -euo pipefail
 
 CHAT="${HOME}/projects/earlyasset/ea-tools/chat.txt"
 LOCK=/tmp/ea-chat.lock
 
-if [ $# -lt 2 ]; then
+if [ $# -lt 1 ]; then
   echo "Usage: chat SENDER \"message\" [\"line 2\" ...]" >&2
+  echo "       chat SENDER   (message read from stdin instead)" >&2
   exit 1
 fi
 
 SENDER="$1"
 shift
+
+MESSAGES=("$@")
+if [ "${#MESSAGES[@]}" -eq 0 ]; then
+  if [ -t 0 ]; then
+    echo "chat: no message given and stdin is a terminal -- pass a message argument or pipe one in" >&2
+    exit 1
+  fi
+  mapfile -t MESSAGES < <(cat)
+  if [ "${#MESSAGES[@]}" -eq 0 ]; then
+    echo "chat: stdin was empty" >&2
+    exit 1
+  fi
+fi
 
 TS=$(date "+%Y-%m-%d %H:%M:%S")
 PREFIX="[$TS] [$SENDER] "
@@ -29,7 +54,7 @@ INDENT=$(printf "%${#PREFIX}s" "")
 # Build the lines to write, then atomic-append with flock
 LINES=""
 FIRST=1
-for msg in "$@"; do
+for msg in "${MESSAGES[@]}"; do
   if [ "$FIRST" = "1" ]; then
     LINES="${PREFIX}${msg}"$'\n'
     FIRST=0
