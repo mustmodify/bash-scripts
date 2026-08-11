@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# pr-review-audit — which open PRs have had no machine review, and which carry unresolved threads.
+#
+# Reports only. It never re-triggers a review: re-triggering in bulk is what
+# hit the rate limit that produced the refusals this exists to find.
+#
+# Two populations, and the second is the easier one to miss. A PR with no
+# review advertises that something is absent. A reviewed PR with an open
+# thread looks handled from every angle except the one nobody checks.
+#
+# UNREVIEWED is judged by the ABSENCE of a real review, never by matching the
+# refusal text — CodeRabbit has already changed that wording once ("Review
+# limit reached" vs "Action not completed"), and a check keyed to one phrasing
+# let PR #4041 sit unnoticed for six days. Both channels are read, because a
+# review can arrive as an issue comment or through the reviews API and either
+# alone is a partial answer.
+#
+# THREADS is a prompt to look, not a defect list. An unresolved thread is
+# equally "nobody read this" and "answered weeks ago, never closed" — the two
+# render identically and only one is outstanding.
+#
+# Usage: pr-review-audit [--json]
+set -euo pipefail
+
+REPO_OWNER=EarlyAsset
+REPO_NAME=earlyasset
+
+raw=$(gh api graphql --paginate -f owner="$REPO_OWNER" -f name="$REPO_NAME" -f query='
+query($owner:String!, $name:String!, $endCursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(states:OPEN, first:50, after:$endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title createdAt url
+        author { login __typename }
+        # first, not last: the walkthrough is posted at the start of a review,
+        # so the most-recent hundred drops it on a busy PR and reports a
+        # properly reviewed one as unreviewed. Found by dev-3.
+        comments(first:100) { nodes { author { login } body } }
+        reviews(last:100) { nodes { author { login } } }
+        reviewThreads(first:100) {
+          nodes {
+            isResolved path line
+            comments(first:1) { nodes { author { login } body url } }
+          }
+        }
+      }
+    }
+  }
+}')
+
+echo "$raw" | jq -s --arg now "$(date -u +%s)" '
+  def bot: "coderabbitai";
+  [ .[].data.repository.pullRequests.nodes[] ] as $prs
+  | [ $prs[]
+      | (.comments.nodes | map(select(.author.login == bot))) as $botComments
+      | (.reviews.nodes  | map(select(.author.login == bot))) as $botReviews
+      # A real review in the comments channel announces itself as a walkthrough
+      # or as posted actionable comments. Anything else from the bot is chatter
+      # or a refusal, whatever words it used.
+      | ([ $botComments[] | select(.body | test("Walkthrough|Actionable comments posted")) ] | length) as $realComments
+      | ($realComments > 0 or ($botReviews | length) > 0) as $reviewed
+      | (.reviewThreads.nodes | map(select(.isResolved == false))) as $open
+      | {
+          number, title, url,
+          author: .author.login,
+          age_days: ((($now | tonumber) - (.createdAt | fromdateiso8601)) / 86400 | floor),
+          # A bot-authored PR is skipped by .coderabbit.yml on purpose ("Bot
+          # user detected"), so it is not a gap. Keyed off the author being a
+          # Bot rather than off the skip wording — the reason for the skip is
+          # structural, the sentence announcing it is not.
+          status: (if .author.__typename == "Bot" then "skipped-bot"
+                   elif $reviewed then "reviewed"
+                   elif ($botComments | length) > 0 then "refused"
+                   else "never-ran" end),
+          unresolved: ($open | length),
+          unresolved_from: ($open | map(.comments.nodes[0].author.login) | unique),
+          # The finding itself, not a count of findings. A thread dated before
+          # your last commit on a PR you have been active on is not therefore
+          # handled — assuming so is the failure this exists to catch, so the
+          # report has to make reading it cheaper than assuming.
+          threads: [ $open[] | {
+            where: (if .path then "\(.path):\(.line // "?")" else "(whole PR)" end),
+            who: .comments.nodes[0].author.login,
+            url: .comments.nodes[0].url,
+            said: (.comments.nodes[0].body
+                   | gsub("<!--.*?-->"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | .[0:220])
+          } ]
+        } ]
+  | sort_by(-.age_days)' > /tmp/pr-review-audit.$$.json
+
+if [[ "${1:-}" == "--json" ]]; then
+  cat /tmp/pr-review-audit.$$.json
+  rm -f /tmp/pr-review-audit.$$.json
+  exit 0
+fi
+
+jq -r '
+  ([.[] | select(.status == "skipped-bot")]) as $skipped
+  | ([.[] | select(.status != "reviewed" and .status != "skipped-bot")]) as $unreviewed
+  | ([.[] | select(.unresolved > 0)]) as $threads
+  | "NO MACHINE REVIEW (\($unreviewed | length)) — oldest first, age is how long it has gone unreviewed",
+    (if ($unreviewed | length) == 0 then "  none" else
+      ($unreviewed[] | "  #\(.number)  \(.age_days)d  \(.status)  \(.author)  \(.title[0:58])") end),
+    "",
+    "UNRESOLVED THREADS (\($threads | length)) — a prompt to look, not a defect list:",
+    "  an answered-but-never-closed thread reads identically to one nobody saw.",
+    (if ($threads | length) == 0 then "  none" else
+      ($threads[]
+       | "  #\(.number)  \(.title[0:60])",
+         (.threads[] | "      \(.who) on \(.where)\n      \(.said)\n      \(.url)")) end),
+    "",
+    "Skipped by config, not a gap: \($skipped | length) bot-authored PRs."
+' /tmp/pr-review-audit.$$.json
+
+rm -f /tmp/pr-review-audit.$$.json
