@@ -30,6 +30,7 @@ GitHub
 | Script | Description |
 |--------|-------------|
 | `tlist [status]` | List tickets from GitHub Project Board. Requires `GITHUB_ORG` and `GITHUB_PROJECT_NUMBER` env vars. |
+| `pr-review-audit [--json]` | Open PRs with no machine review, and open PRs carrying unresolved threads. Read-only; never re-triggers a review. |
 
 Rails
 --------------------
