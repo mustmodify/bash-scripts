@@ -26,33 +26,37 @@ set -euo pipefail
 
 REPO=EarlyAsset/earlyasset
 AGENT_RE='\[agent [a-z0-9-]+\]'
+# Named capture, for display: every push goes through one shared account, so
+# .author.login is "mustmodify" on every review regardless of which agent
+# wrote it — the [agent dev-N] tag is the only place authorship actually
+# lives, and it's half the reason the tag exists (dispatcher routes
+# re-reviews by author, "not the person who wrote it" is a real rule).
+AGENT_CAPTURE_RE='\[agent (?<id>[a-z0-9-]+)\]'
 VERDICT_RE='\[verdict: (pass|changes-needed)\]'
+
+# ONE function, so there is only one place normalisation can be skipped —
+# a hardcoded default that bypassed this and stayed correct by hand was
+# exactly the gap dev-2 found: unpadded input sorts wrong against a
+# zero-padded submittedAt in the jq comparison below, silently and in the
+# wrong direction (a real verdict reading as pre-cutover). PARSED, not
+# pattern-matched: a regex shape check let month 13 and Feb 30 through,
+# since both match \d{4}-\d{2}-\d{2}... and are still wrong dates. date -d
+# rejects what it can't resolve to an actual moment, which a shape can't.
+normalize_cutover() {
+  local raw="$1" out
+  if [ -z "$raw" ] || ! out=$(date -u -d "$raw" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+    echo "ERROR: --cutover must be a real ISO 8601 UTC moment, e.g. 2026-08-11T18:56:00Z. Got: '${raw}'" >&2
+    exit 1
+  fi
+  echo "$out"
+}
 
 # The process prose changed in metis's commit 9dd9ed5. Before that, nothing
 # had been told to post a verdict as a review, so no PR can fairly be judged
 # against a rule it didn't know about yet.
-CUTOVER="2026-08-11T18:56:00Z"
+CUTOVER=$(normalize_cutover "2026-08-11T18:56:00Z")
 if [ "${1:-}" = "--cutover" ]; then
-  CUTOVER="${2:-}"
-  # A garbage or empty --cutover fails SILENTLY otherwise: an empty string
-  # sorts before every real timestamp in the jq comparison below, so it
-  # disables the gate rather than erroring, and a malformed one just excludes
-  # every real verdict from consideration. Both misreport a genuinely
-  # at-head PR as "review unknown" with nothing on stderr. dev-2's catch.
-  #
-  # PARSED, not pattern-matched: a regex shape check let month 13 and Feb 30
-  # through, since both match \d{4}-\d{2}-\d{2}... and are still wrong dates
-  # that would silently misclassify a real verdict. date -d rejects what it
-  # can't actually resolve to a moment, which a shape can't distinguish.
-  if [ -z "$CUTOVER" ] || ! CUTOVER=$(date -u -d "$CUTOVER" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
-    echo "ERROR: --cutover must be a real ISO 8601 UTC moment, e.g. 2026-08-11T18:56:00Z. Got: '${2:-}'" >&2
-    exit 1
-  fi
-  # Re-parsed to fixed-width canonical form: the jq comparison below is a
-  # lexicographic string compare against submittedAt, which only orders
-  # correctly if every value has the same width — date -d accepts looser
-  # input than that (single-digit hours, relative phrases) and this pins the
-  # output shape regardless of what shape the input arrived in.
+  CUTOVER=$(normalize_cutover "${2:-}")
   shift 2
 fi
 
@@ -94,9 +98,9 @@ for pr in "${prs[@]}"; do
   # currently fire: a review-shaped verdict cannot predate the mechanism that
   # makes reviews carry the token, but asserting that instead of checking it
   # is exactly the kind of unverified assumption today cost us four times.
-  latest=$(echo "$reviews" | jq -r --arg re "$VERDICT_RE" --arg cutover "$CUTOVER" '
+  latest=$(echo "$reviews" | jq -r --arg re "$VERDICT_RE" --arg cap "$AGENT_CAPTURE_RE" --arg cutover "$CUTOVER" '
     map(select(.body | test($re)) | select(.submittedAt >= $cutover)) | sort_by(.submittedAt) | last
-    | if . then "\(.submittedAt)\t\(.author.login)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
+    | if . then "\(.submittedAt)\t\(.body | capture($cap).id)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
       else "" end')
 
   printf '#%s  head=%s  findings posted=%s  ' "$pr" "${head:0:8}" "$findings"
