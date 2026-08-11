@@ -1,25 +1,15 @@
 #!/usr/bin/env bash
-# pr-review-audit — which open PRs have had no machine review, and which carry unresolved threads.
+# pr-review-audit — open PRs with no machine review, and those carrying unresolved threads.
+# Usage: pr-review-audit [--json]
 #
-# Reports only. It never re-triggers a review: re-triggering in bulk is what
-# hit the rate limit that produced the refusals this exists to find.
-#
-# Two populations, and the second is the easier one to miss. A PR with no
-# review advertises that something is absent. A reviewed PR with an open
-# thread looks handled from every angle except the one nobody checks.
+# Never re-triggers a review: bulk re-triggering is what hit the rate limit
+# that produced the refusals this exists to find.
 #
 # UNREVIEWED is judged by the ABSENCE of a real review, never by matching the
-# refusal text — CodeRabbit has already changed that wording once ("Review
-# limit reached" vs "Action not completed"), and a check keyed to one phrasing
-# let PR #4041 sit unnoticed for six days. Both channels are read, because a
-# review can arrive as an issue comment or through the reviews API and either
-# alone is a partial answer.
-#
-# THREADS is a prompt to look, not a defect list. An unresolved thread is
-# equally "nobody read this" and "answered weeks ago, never closed" — the two
-# render identically and only one is outstanding.
-#
-# Usage: pr-review-audit [--json]
+# refusal text — the wording already changed once between windows, and a check
+# keyed to one phrasing let #4041 sit unnoticed for six days. Both channels are
+# read: a review arrives as an issue comment or through the reviews API, and
+# either alone is a partial answer.
 set -euo pipefail
 
 REPO_OWNER=EarlyAsset
