@@ -38,7 +38,10 @@ SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d)
 # headless, or from a worktree on another branch. Full forty characters,
 # always: a SHA comparison against an abbreviation silently matches nothing and
 # reports every merge as unverified, which is indistinguishable from the finding.
-gh api "repos/$REPO/commits?sha=develop&since=${SINCE}T00:00:00Z&per_page=100" \
+# --paginate rather than a bare per_page: 56 merges landed in four days, so the
+# default window overflows one page, and a silently truncated first page would
+# under-report exactly the merges that went in unverified.
+gh api --paginate "repos/$REPO/commits?sha=develop&since=${SINCE}T00:00:00Z&per_page=100" \
   --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv' > /tmp/mv-merges.$$
 
 # One call for every run rather than one per commit: --commit would be a
@@ -55,6 +58,7 @@ gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
 # testing it is what showed that up: pointed at the wrong workflow it still
 # found three incidental matches, passed, and reported 53 merges as unverified.
 # A control that a broken query can satisfy is not a control.
+probes_with_runs=0
 for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
   # `gh run list --commit` silently returns nothing for an abbreviated SHA, so a
   # truncated probe would report NO RUN for a merge that ran — the control would
@@ -65,12 +69,32 @@ for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
   fi
   direct=$(gh run list -R "$REPO" --commit "$probe" --workflow CI --limit 5 --json conclusion --jq 'length')
   joined=$(jq -r --arg s "$probe" '[.[] | select(.headSha == $s)] | length' /tmp/mv-runs.$$)
+  [ "$direct" -gt 0 ] && probes_with_runs=$((probes_with_runs + 1))
   if [ "$direct" -gt 0 ] && [ "$joined" -eq 0 ]; then
-    echo "CONTROL FAILED: ${probe:0:8} has $direct CI run(s) by direct query, none by the join." >&2
-    echo "The join is broken, so every NO RUN below is unreliable. Do not report these numbers." >&2
-    exit 2
+    # Re-read before failing. GitHub serves inconsistent data across its own
+    # endpoints, and this control fired once on a merge whose run both queries
+    # agreed about seconds later. A control that cries wolf on ordinary lag
+    # gets ignored, which costs more than the case it guards.
+    gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
+      --json headSha,status,conclusion > /tmp/mv-runs.$$
+    joined=$(jq -r --arg s "$probe" '[.[] | select(.headSha == $s)] | length' /tmp/mv-runs.$$)
+    if [ "$joined" -eq 0 ]; then
+      echo "CONTROL FAILED: ${probe:0:8} has $direct CI run(s) by direct query, none by the join," >&2
+      echo "and still none after a re-read. Do not report these numbers." >&2
+      exit 2
+    fi
   fi
 done
+
+# The probe and the join share --workflow CI, so a wrong workflow name silently
+# zeroes BOTH and the disagreement check above can never fire — zero and zero
+# agree. Eight recent merges with no run between them is implausible enough to
+# stop for, and it is the only symptom that case produces (dev-3's catch).
+if [ "$probes_with_runs" -eq 0 ]; then
+  echo "CONTROL FAILED: none of the 8 sampled merges has a CI run by direct query." >&2
+  echo "Most likely the workflow name is wrong, which zeroes the join and the control alike." >&2
+  exit 2
+fi
 
 printf 'MERGES TO DEVELOP, LAST %s DAYS — was the merge itself verified?\n\n' "$DAYS"
 while IFS=$'\t' read -r sha subject; do
