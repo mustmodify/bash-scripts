@@ -30,6 +30,7 @@ GitHub
 | Script | Description |
 |--------|-------------|
 | `tlist [status]` | List tickets from GitHub Project Board. Requires `GITHUB_ORG` and `GITHUB_PROJECT_NUMBER` env vars. |
+| `verdict-at-head [PR...]` | Is the newest peer verdict on a PR at head, stale, or absent. Read-only. |
 
 Rails
 --------------------

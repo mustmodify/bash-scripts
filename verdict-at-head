@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# verdict-at-head — for a PR, is the newest peer verdict at head, stale, or absent?
+# Usage: verdict-at-head [--cutover ISO8601] [PR-number ...]
+#
+# No PR numbers: scopes to the CALLING DEV's own open PRs, via TRON_AGENT_NAME
+# or the current branch's --<agent-id> suffix — NOT --author @me, which
+# resolves to the shared push account and returns every open PR from every
+# agent on this fleet (dev-2's catch: confirmed by running it).
+#
+# The check dev-3 did by hand on #4171: pull comments and commits, compare
+# timestamps. Too costly to do on every push, so this automates the READING
+# only — it never comments, resolves a thread, or changes Patch state.
+#
+# A verdict is a review posted with event COMMENT, carrying [verdict: pass] or
+# [verdict: changes-needed] alongside the [agent dev-N] tag; the review object
+# carries the exact commit reviewed, so comparison is oid to oid, not
+# timestamps — a review that starts before a push and lands after it is newer
+# than head while describing the prior commit, so a timestamp reads it as
+# current and is wrong in the direction this exists to catch.
+#
+# A CodeRabbit review is never a verdict, at head or otherwise — excluded
+# regardless of what it says (dispatcher's ruling, 2026-08-11).
+#
+# PRE-CUTOVER PRs ARE UNASSESSABLE, NOT UNVERIFIED. The [verdict: ...]
+# convention requires agents to post verdicts as reviews, which nothing did
+# before the process prose said to. Reporting those PRs as never-verdicted
+# would be false and the fastest way to lose trust in this on its first run.
+# --cutover names the moment the prose changed; PRs whose only human activity
+# predates it report "review unknown", never "absent".
+set -euo pipefail
+
+REPO=EarlyAsset/earlyasset
+# ONE fragment, two regexes built from it, so they cannot drift apart. Two
+# independently-typed patterns agreeing today is not a guarantee — dev-2
+# proved the failure mode: capture() on no-match produces ZERO jq outputs,
+# not null and not an error, so a filter regex and a capture regex that
+# silently drifted apart would make $latest empty for a PR with a real,
+# current, passing verdict. The script would then report verified work
+# exactly as it reports untouched work — indistinguishable from correct,
+# which is the same direction as the cutover bug and CodeRabbit's refusal
+# reading as a pass: nothing looks wrong, so nothing gets checked.
+AGENT_ID_RE='[a-z0-9-]+'
+AGENT_RE="\\[agent ${AGENT_ID_RE}\\]"
+AGENT_CAPTURE_RE="\\[agent (?<id>${AGENT_ID_RE})\\]"
+VERDICT_RE='\[verdict: (pass|changes-needed)\]'
+
+# ONE function, so there is only one place normalisation can be skipped —
+# a hardcoded default that bypassed this and stayed correct by hand was
+# exactly the gap dev-2 found: unpadded input sorts wrong against a
+# zero-padded submittedAt in the jq comparison below, silently and in the
+# wrong direction (a real verdict reading as pre-cutover). PARSED, not
+# pattern-matched: a regex shape check let month 13 and Feb 30 through,
+# since both match \d{4}-\d{2}-\d{2}... and are still wrong dates. date -d
+# rejects what it can't resolve to an actual moment, which a shape can't.
+normalize_cutover() {
+  local raw="$1" out
+  if [ -z "$raw" ] || ! out=$(date -u -d "$raw" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+    echo "ERROR: --cutover must be a real ISO 8601 UTC moment, e.g. 2026-08-11T18:56:00Z. Got: '${raw}'" >&2
+    exit 1
+  fi
+  echo "$out"
+}
+
+# The process prose changed in metis's commit 9dd9ed5. Before that, nothing
+# had been told to post a verdict as a review, so no PR can fairly be judged
+# against a rule it didn't know about yet.
+CUTOVER=$(normalize_cutover "2026-08-11T18:56:00Z")
+if [ "${1:-}" = "--cutover" ]; then
+  CUTOVER=$(normalize_cutover "${2:-}")
+  shift 2
+fi
+
+if [ "$#" -gt 0 ]; then
+  prs=("$@")
+else
+  # --author @me does not scope to the calling dev: the fleet shares one push
+  # account (mustmodify), so @me resolves to it and --author @me returns
+  # every open PR from every agent. The documented use case — "a dev runs
+  # this against their own open PRs" — was undeliverable through it (dev-2's
+  # catch, confirmed by running it: all five --dev-N suffixes came back).
+  #
+  # Scope by the branch suffix instead — the same `--<agent-id>` convention
+  # io-tower already parses for webhook attribution (dev.md: the fleet's only
+  # authorship signal on a shared account is `branch.rpartition('--').last`).
+  DEV_ID="${TRON_AGENT_NAME:-}"
+  branch=""
+  if [ -z "$DEV_ID" ]; then
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    DEV_ID="${branch##*--}"
+  fi
+  if [ -z "$DEV_ID" ] || [ "$DEV_ID" = "$branch" ]; then
+    echo "ERROR: can't determine which agent to scope to. Set TRON_AGENT_NAME," >&2
+    echo "run this from inside a --<agent-id> branch, or pass PR numbers explicitly." >&2
+    exit 1
+  fi
+  # gh's --jq takes one expression, not --arg — the suffix has to be baked
+  # into the filter string, not passed as a jq variable the way a plain jq
+  # invocation would take it. Caught by actually running this branch: the
+  # first version failed with "unknown flag: --dev-5", gh parsing --arg's
+  # value as a second flag rather than as jq's argument.
+  prs=($(gh pr list -R "$REPO" --state open --json number,headRefName \
+    --jq ".[] | select(.headRefName | endswith(\"--${DEV_ID}\")) | .number"))
+fi
+
+all_clean=0
+for pr in "${prs[@]}"; do
+  data=$(gh api graphql -f query='
+    query($owner:String!,$name:String!,$n:Int!){
+      repository(owner:$owner,name:$name){
+        pullRequest(number:$n){
+          headRefOid headRefName
+          reviews(last:50){nodes{author{login} state submittedAt body commit{oid}}}
+          comments(last:50){nodes{author{login} body}}
+        }
+      }
+    }' -f owner=EarlyAsset -f name=earlyasset -F n="$pr")
+
+  head=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefOid')
+  # Printed regardless of how the list was built — explicit PR numbers can
+  # mix ownership just as easily as a broken filter can. A dev shouldn't have
+  # to go find the branch name themselves to know whose PR is whose.
+  branch_owner=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefName' | sed 's/.*--//')
+
+  # A finding and a verdict are both authored by an agent, so the [agent ...]
+  # tag is required for either — an empty-body automated review (seen on
+  # #3403 from a non-agent account) is neither, and dropping the tag
+  # requirement counted it as a finding by accident on an earlier draft.
+  reviews=$(echo "$data" | jq --arg agent "$AGENT_RE" \
+    '.data.repository.pullRequest.reviews.nodes
+     | map(select(.author.login != "coderabbitai"))
+     | map(select(.body | test($agent)))')
+  # Named "posted", not "open": this counts agent-tagged reviews carrying no
+  # verdict token, and checks nothing about thread resolution, so a finding
+  # answered weeks ago still counts. Renamed rather than taught to check
+  # resolution too — the tool's job is the verdict answer (dev-2/dispatcher).
+  findings=$(echo "$reviews" | jq --arg re "$VERDICT_RE" '[.[] | select(.body | test($re) | not)] | length')
+  # Filtered to submittedAt >= cutover on principle rather than because it can
+  # currently fire: a review-shaped verdict cannot predate the mechanism that
+  # makes reviews carry the token, but asserting that instead of checking it
+  # is exactly the kind of unverified assumption today cost us four times.
+  latest=$(echo "$reviews" | jq -r --arg re "$VERDICT_RE" --arg cap "$AGENT_CAPTURE_RE" --arg cutover "$CUTOVER" '
+    map(select(.body | test($re)) | select(.submittedAt >= $cutover)) | sort_by(.submittedAt) | last
+    | if . then "\(.submittedAt)\t\(.body | capture($cap).id)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
+      else "" end')
+
+  printf '#%s (%s)  head=%s  findings posted=%s  ' "$pr" "$branch_owner" "${head:0:8}" "$findings"
+
+  if [ -z "$latest" ]; then
+    # No verdict-shaped REVIEW exists. Before cutover, verdicts were posted as
+    # plain comments — invisible to the reviews query — so check comments too
+    # before calling this PR untouched rather than merely unconverted.
+    any_activity=$(echo "$data" | jq --arg agent "$AGENT_RE" \
+      "(.data.repository.pullRequest.reviews.nodes | map(select(.author.login != \"coderabbitai\")) | map(select(.body | test(\$agent))) | length) + (.data.repository.pullRequest.comments.nodes | map(select(.body | test(\$agent))) | length)")
+    all_clean=1
+    if [ "$any_activity" -gt 0 ]; then
+      printf 'verdict=review unknown (pre-cutover human activity, no review-shaped verdict)\n'
+      continue
+    fi
+    printf 'verdict=ABSENT\n'
+    continue
+  fi
+
+  IFS=$'\t' read -r vdate vauthor void vtype <<<"$latest"
+  if [ "$void" = "$head" ] && [ "$vtype" = "pass" ] && [ "$findings" -eq 0 ]; then
+    printf 'verdict=pass by %s  AT HEAD\n' "$vauthor"
+  elif [ "$void" = "$head" ] && [ "$vtype" = "pass" ]; then
+    # The text this branch used to print was IDENTICAL to the clean case
+    # above — same "verdict=pass ... AT HEAD" — while the exit code differed.
+    # A human reading the line saw success; a caller reading the exit code
+    # saw failure. Named as its own outcome so the two can't disagree.
+    printf 'verdict=pass by %s  AT HEAD, BUT %s finding(s) still lack a verdict — NOT CLEAN\n' "$vauthor" "$findings"
+    all_clean=1
+  elif [ "$void" = "$head" ]; then
+    printf 'verdict=%s by %s  AT HEAD\n' "$vtype" "$vauthor"
+    all_clean=1
+  else
+    printf 'verdict=%s by %s on %s  STALE (head has moved since)\n' "$vtype" "$vauthor" "${void:0:8}"
+    all_clean=1
+  fi
+done
+
+# Exit 0 only when every checked PR is fully clean: a pass verdict, at head,
+# with no findings still lacking that verdict. Anything else — stale, absent,
+# review unknown, changes-needed, or an unconfirmed finding — exits 1, so a
+# caller (wi-1006 will be one) can branch on this without parsing text.
+exit "$all_clean"
