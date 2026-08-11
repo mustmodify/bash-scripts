@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 # merge-verified — did each merge to develop actually get its CI run?
+# Usage: merge-verified [days] (default 7), or --self-test
 #
-# A PR's own checks answer what the BRANCH's CI said. The merge commit gets a
-# separate run on develop, and merges landing close together cancel each
-# other's. So "CI was green" on a merged PR is a claim about the branch, never
-# about what went into develop — and the author's natural check cannot show it.
-#
-# Reports only. Interim cover while the queueing fix goes through the pipeline
-# it fixes; it also speaks to merges that already went in unverified, which a
-# forward fix cannot.
-#
-# Usage: merge-verified [days]   (default 7)
+# A PR's checks answer what the BRANCH's CI said. The merge commit gets its own
+# run, and merges landing close together cancel each other's — so gh pr checks
+# cannot show whether what reached develop was ever verified. Reports only.
 set -euo pipefail
 
 REPO=EarlyAsset/earlyasset
 
-# --self-test proves the abbreviated-SHA hazard is real and that we aren't
-# exposed to it, rather than asserting so in a comment.
 if [ "${1:-}" = "--self-test" ]; then
   full=$(gh api "repos/$REPO/commits?sha=develop&per_page=1" --jq '.[0].sha')
   n_full=$(gh run list -R "$REPO" --commit "$full" --workflow CI --limit 5 --json conclusion --jq 'length')
@@ -34,35 +26,24 @@ fi
 DAYS=${1:-7}
 SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d)
 
-# Read develop from the API rather than a local clone, so this runs anywhere —
-# headless, or from a worktree on another branch. Full forty characters,
-# always: a SHA comparison against an abbreviation silently matches nothing and
-# reports every merge as unverified, which is indistinguishable from the finding.
-# --paginate rather than a bare per_page: 56 merges landed in four days, so the
-# default window overflows one page, and a silently truncated first page would
-# under-report exactly the merges that went in unverified.
+# --paginate because 56 merges landed in four days: a truncated page would
+# under-report exactly the unverified merges this exists to find.
 gh api --paginate "repos/$REPO/commits?sha=develop&since=${SINCE}T00:00:00Z&per_page=100" \
   --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv' > /tmp/mv-merges.$$
 
-# One call for every run rather than one per commit: --commit would be a
-# request per merge, and the join is local anyway.
 gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
   --json headSha,status,conclusion > /tmp/mv-runs.$$
 
-# THE CONTROL, and it cross-checks a DIFFERENT code path rather than this
-# query's own output. Take a sample of merges and ask GitHub about each one
-# directly with --commit; if the bulk join says a merge has no run while the
-# direct query finds one, the join is broken and every "NO RUN" below is a lie.
-#
-# An earlier version of this control only asked whether ANY merge matched, and
-# testing it is what showed that up: pointed at the wrong workflow it still
-# found three incidental matches, passed, and reported 53 merges as unverified.
-# A control that a broken query can satisfy is not a control.
+# The control cross-checks a DIFFERENT code path, not this query's own output.
+# Two earlier versions could pass while the query was broken: one asked merely
+# whether any merge matched (three incidental matches let it through), and one
+# shared --workflow with the query, so a wrong name zeroed both and the
+# disagreement could never fire. A control that inherits the wrong query's
+# assumptions is not a control.
 probes_with_runs=0
 for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
-  # `gh run list --commit` silently returns nothing for an abbreviated SHA, so a
-  # truncated probe would report NO RUN for a merge that ran — the control would
-  # then be wrong in the same direction as the bug. --self-test proves this.
+  # --commit silently returns nothing for a short SHA, which would report NO RUN
+  # for a merge that ran — wrong in the same direction as the bug.
   if [ ${#probe} -ne 40 ]; then
     echo "CONTROL FAILED: probe SHA ${probe} is ${#probe} chars, not 40." >&2
     exit 2
@@ -86,10 +67,8 @@ for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
   fi
 done
 
-# The probe and the join share --workflow CI, so a wrong workflow name silently
-# zeroes BOTH and the disagreement check above can never fire — zero and zero
-# agree. Eight recent merges with no run between them is implausible enough to
-# stop for, and it is the only symptom that case produces (dev-3's catch).
+# Eight recent merges with no run between them is the only symptom a wrong
+# workflow name produces, since it zeroes the join and the probe alike.
 if [ "$probes_with_runs" -eq 0 ]; then
   echo "CONTROL FAILED: none of the 8 sampled merges has a CI run by direct query." >&2
   echo "Most likely the workflow name is wrong, which zeroes the join and the control alike." >&2
