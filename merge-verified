@@ -45,6 +45,14 @@ gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
 # shared --workflow with the query, so a wrong name zeroed both and the
 # disagreement could never fire. A control that inherits the wrong query's
 # assumptions is not a control.
+# A quiet weekend is not a broken query: with no merges the loop never runs,
+# both counters stay zero, and every check below would blame the workflow name.
+if [ ! -s /tmp/mv-merges.$$ ]; then
+  echo "No merges to develop in the last $DAYS days. Nothing to verify."
+  rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$
+  exit 0
+fi
+
 probes_with_runs=0
 for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
   # --commit silently returns nothing for a short SHA, which would report NO RUN
