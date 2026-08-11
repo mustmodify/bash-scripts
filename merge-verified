@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# merge-verified — did each merge to develop actually get its CI run?
+#
+# A PR's own checks answer what the BRANCH's CI said. The merge commit gets a
+# separate run on develop, and merges landing close together cancel each
+# other's. So "CI was green" on a merged PR is a claim about the branch, never
+# about what went into develop — and the author's natural check cannot show it.
+#
+# Reports only. Interim cover while the queueing fix goes through the pipeline
+# it fixes; it also speaks to merges that already went in unverified, which a
+# forward fix cannot.
+#
+# Usage: merge-verified [days]   (default 7)
+set -euo pipefail
+
+REPO=EarlyAsset/earlyasset
+
+# --self-test proves the abbreviated-SHA hazard is real and that we aren't
+# exposed to it, rather than asserting so in a comment.
+if [ "${1:-}" = "--self-test" ]; then
+  full=$(gh api "repos/$REPO/commits?sha=develop&per_page=1" --jq '.[0].sha')
+  n_full=$(gh run list -R "$REPO" --commit "$full" --workflow CI --limit 5 --json conclusion --jq 'length')
+  n_short=$(gh run list -R "$REPO" --commit "${full:0:8}" --workflow CI --limit 5 --json conclusion --jq 'length')
+  echo "full SHA ${full:0:8}...: $n_full run(s);  abbreviated: $n_short run(s)"
+  if [ "$n_full" -eq 0 ]; then
+    echo "INCONCLUSIVE: newest merge has no run yet, so the comparison proves nothing. Retry later." >&2
+    exit 2
+  fi
+  [ "$n_short" -eq 0 ] && echo "PASS: an abbreviated SHA does silently return nothing, and this script only ever passes 40 chars." && exit 0
+  echo "UNEXPECTED: the abbreviated SHA matched. gh behaviour has changed; re-read the control." >&2
+  exit 2
+fi
+
+DAYS=${1:-7}
+SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d)
+
+# Read develop from the API rather than a local clone, so this runs anywhere —
+# headless, or from a worktree on another branch. Full forty characters,
+# always: a SHA comparison against an abbreviation silently matches nothing and
+# reports every merge as unverified, which is indistinguishable from the finding.
+gh api "repos/$REPO/commits?sha=develop&since=${SINCE}T00:00:00Z&per_page=100" \
+  --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv' > /tmp/mv-merges.$$
+
+# One call for every run rather than one per commit: --commit would be a
+# request per merge, and the join is local anyway.
+gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
+  --json headSha,status,conclusion > /tmp/mv-runs.$$
+
+# THE CONTROL, and it cross-checks a DIFFERENT code path rather than this
+# query's own output. Take a sample of merges and ask GitHub about each one
+# directly with --commit; if the bulk join says a merge has no run while the
+# direct query finds one, the join is broken and every "NO RUN" below is a lie.
+#
+# An earlier version of this control only asked whether ANY merge matched, and
+# testing it is what showed that up: pointed at the wrong workflow it still
+# found three incidental matches, passed, and reported 53 merges as unverified.
+# A control that a broken query can satisfy is not a control.
+for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
+  # `gh run list --commit` silently returns nothing for an abbreviated SHA, so a
+  # truncated probe would report NO RUN for a merge that ran — the control would
+  # then be wrong in the same direction as the bug. --self-test proves this.
+  if [ ${#probe} -ne 40 ]; then
+    echo "CONTROL FAILED: probe SHA ${probe} is ${#probe} chars, not 40." >&2
+    exit 2
+  fi
+  direct=$(gh run list -R "$REPO" --commit "$probe" --workflow CI --limit 5 --json conclusion --jq 'length')
+  joined=$(jq -r --arg s "$probe" '[.[] | select(.headSha == $s)] | length' /tmp/mv-runs.$$)
+  if [ "$direct" -gt 0 ] && [ "$joined" -eq 0 ]; then
+    echo "CONTROL FAILED: ${probe:0:8} has $direct CI run(s) by direct query, none by the join." >&2
+    echo "The join is broken, so every NO RUN below is unreliable. Do not report these numbers." >&2
+    exit 2
+  fi
+done
+
+printf 'MERGES TO DEVELOP, LAST %s DAYS — was the merge itself verified?\n\n' "$DAYS"
+while IFS=$'\t' read -r sha subject; do
+  pr=$(printf '%s' "$subject" | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' || true)
+  verdict=$(jq -r --arg s "$sha" '
+    [.[] | select(.headSha == $s)] as $runs
+    | if ($runs | length) == 0 then "NO RUN"
+      elif ($runs | map(select(.conclusion == "success")) | length) > 0 then "verified"
+      elif ($runs | map(select(.conclusion == "cancelled")) | length) > 0 then "CANCELLED"
+      elif ($runs | map(select(.status != "completed")) | length) > 0 then "running"
+      else "FAILED: " + ($runs[0].conclusion // "?") end' /tmp/mv-runs.$$)
+  printf '  %s  %-9s  %s\n' "${sha:0:8}" "${pr:+#$pr}" "$verdict"
+done < /tmp/mv-merges.$$ | tee /tmp/mv-out.$$
+
+printf '\n%s merges: %s verified, %s cancelled, %s with no run, %s failed, %s still running.\n' \
+  "$(wc -l < /tmp/mv-merges.$$)" \
+  "$(grep -c ' verified$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' CANCELLED$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' NO RUN$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' FAILED' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' running$' /tmp/mv-out.$$ || true)"
+
+printf '\n"NO RUN" and "CANCELLED" both mean develop never verified that merge.\n'
+printf 'They differ in cause, not in consequence: cancelled by a following merge,\n'
+printf 'versus never triggered at all.\n'
+
+rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$ /tmp/mv-out.$$
