@@ -25,13 +25,18 @@
 set -euo pipefail
 
 REPO=EarlyAsset/earlyasset
-AGENT_RE='\[agent [a-z0-9-]+\]'
-# Named capture, for display: every push goes through one shared account, so
-# .author.login is "mustmodify" on every review regardless of which agent
-# wrote it — the [agent dev-N] tag is the only place authorship actually
-# lives, and it's half the reason the tag exists (dispatcher routes
-# re-reviews by author, "not the person who wrote it" is a real rule).
-AGENT_CAPTURE_RE='\[agent (?<id>[a-z0-9-]+)\]'
+# ONE fragment, two regexes built from it, so they cannot drift apart. Two
+# independently-typed patterns agreeing today is not a guarantee — dev-2
+# proved the failure mode: capture() on no-match produces ZERO jq outputs,
+# not null and not an error, so a filter regex and a capture regex that
+# silently drifted apart would make $latest empty for a PR with a real,
+# current, passing verdict. The script would then report verified work
+# exactly as it reports untouched work — indistinguishable from correct,
+# which is the same direction as the cutover bug and CodeRabbit's refusal
+# reading as a pass: nothing looks wrong, so nothing gets checked.
+AGENT_ID_RE='[a-z0-9-]+'
+AGENT_RE="\\[agent ${AGENT_ID_RE}\\]"
+AGENT_CAPTURE_RE="\\[agent (?<id>${AGENT_ID_RE})\\]"
 VERDICT_RE='\[verdict: (pass|changes-needed)\]'
 
 # ONE function, so there is only one place normalisation can be skipped —
