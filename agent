@@ -23,7 +23,7 @@ slug="${slug#-}"
 slug="${slug//_/-}"
 projects_dir="$HOME/.claude/projects/$slug"
 
-mcp_path="$HOME/projects/mustmodify/ai-tools/tron-channel-mcp.js"
+mcp_path="$HOME/projects/tron/agents/tron/mcp/tron-channel-mcp.js"
 
 find_latest_session() {
   [ -d "$projects_dir" ] || return 1
@@ -78,9 +78,16 @@ ensure_mcp_config() {
 
 launch() {
   local uuid=${1:-}
+  # Agent tool shells are non-interactive bash: they source $BASH_ENV only —
+  # never .bashrc/.profile — so chruby/ruby were invisible to every agent
+  # (fleet-wide silent PATH workarounds since May). Put ruby on PATH here in
+  # the launcher env (inherited by every tool shell) and point BASH_ENV at
+  # .bashrc for anything else above its interactive guard.
+  export PATH="$HOME/.rubies/ruby-3.3.4/bin:$PATH"
+  export BASH_ENV="$HOME/.bashrc"
   local args=(
     --permission-mode auto
-    --add-dir "$HOME/projects/earlyasset/ea-docs"
+    --add-dir "$HOME/projects/earlyasset/metis"
     --dangerously-load-development-channels server:tron-channel
   )
   if [ -n "$uuid" ]; then
