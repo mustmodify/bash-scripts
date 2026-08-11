@@ -2,6 +2,11 @@
 # verdict-at-head — for a PR, is the newest peer verdict at head, stale, or absent?
 # Usage: verdict-at-head [--cutover ISO8601] [PR-number ...]
 #
+# No PR numbers: scopes to the CALLING DEV's own open PRs, via TRON_AGENT_NAME
+# or the current branch's --<agent-id> suffix — NOT --author @me, which
+# resolves to the shared push account and returns every open PR from every
+# agent on this fleet (dev-2's catch: confirmed by running it).
+#
 # The check dev-3 did by hand on #4171: pull comments and commits, compare
 # timestamps. Too costly to do on every push, so this automates the READING
 # only — it never comments, resolves a thread, or changes Patch state.
@@ -68,7 +73,33 @@ fi
 if [ "$#" -gt 0 ]; then
   prs=("$@")
 else
-  prs=($(gh pr list -R "$REPO" --author @me --state open --json number --jq '.[].number'))
+  # --author @me does not scope to the calling dev: the fleet shares one push
+  # account (mustmodify), so @me resolves to it and --author @me returns
+  # every open PR from every agent. The documented use case — "a dev runs
+  # this against their own open PRs" — was undeliverable through it (dev-2's
+  # catch, confirmed by running it: all five --dev-N suffixes came back).
+  #
+  # Scope by the branch suffix instead — the same `--<agent-id>` convention
+  # io-tower already parses for webhook attribution (dev.md: the fleet's only
+  # authorship signal on a shared account is `branch.rpartition('--').last`).
+  DEV_ID="${TRON_AGENT_NAME:-}"
+  branch=""
+  if [ -z "$DEV_ID" ]; then
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    DEV_ID="${branch##*--}"
+  fi
+  if [ -z "$DEV_ID" ] || [ "$DEV_ID" = "$branch" ]; then
+    echo "ERROR: can't determine which agent to scope to. Set TRON_AGENT_NAME," >&2
+    echo "run this from inside a --<agent-id> branch, or pass PR numbers explicitly." >&2
+    exit 1
+  fi
+  # gh's --jq takes one expression, not --arg — the suffix has to be baked
+  # into the filter string, not passed as a jq variable the way a plain jq
+  # invocation would take it. Caught by actually running this branch: the
+  # first version failed with "unknown flag: --dev-5", gh parsing --arg's
+  # value as a second flag rather than as jq's argument.
+  prs=($(gh pr list -R "$REPO" --state open --json number,headRefName \
+    --jq ".[] | select(.headRefName | endswith(\"--${DEV_ID}\")) | .number"))
 fi
 
 all_clean=0
@@ -77,7 +108,7 @@ for pr in "${prs[@]}"; do
     query($owner:String!,$name:String!,$n:Int!){
       repository(owner:$owner,name:$name){
         pullRequest(number:$n){
-          headRefOid
+          headRefOid headRefName
           reviews(last:50){nodes{author{login} state submittedAt body commit{oid}}}
           comments(last:50){nodes{author{login} body}}
         }
@@ -85,6 +116,10 @@ for pr in "${prs[@]}"; do
     }' -f owner=EarlyAsset -f name=earlyasset -F n="$pr")
 
   head=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefOid')
+  # Printed regardless of how the list was built — explicit PR numbers can
+  # mix ownership just as easily as a broken filter can. A dev shouldn't have
+  # to go find the branch name themselves to know whose PR is whose.
+  branch_owner=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefName' | sed 's/.*--//')
 
   # A finding and a verdict are both authored by an agent, so the [agent ...]
   # tag is required for either — an empty-body automated review (seen on
@@ -108,7 +143,7 @@ for pr in "${prs[@]}"; do
     | if . then "\(.submittedAt)\t\(.body | capture($cap).id)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
       else "" end')
 
-  printf '#%s  head=%s  findings posted=%s  ' "$pr" "${head:0:8}" "$findings"
+  printf '#%s (%s)  head=%s  findings posted=%s  ' "$pr" "$branch_owner" "${head:0:8}" "$findings"
 
   if [ -z "$latest" ]; then
     # No verdict-shaped REVIEW exists. Before cutover, verdicts were posted as
