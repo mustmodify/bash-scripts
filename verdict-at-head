@@ -33,7 +33,16 @@ VERDICT_RE='\[verdict: (pass|changes-needed)\]'
 # against a rule it didn't know about yet.
 CUTOVER="2026-08-11T18:56:00Z"
 if [ "${1:-}" = "--cutover" ]; then
-  CUTOVER="$2"
+  CUTOVER="${2:-}"
+  # A garbage or empty --cutover fails SILENTLY otherwise: an empty string
+  # sorts before every real timestamp in the jq comparison below, so it
+  # disables the gate rather than erroring, and a malformed one just excludes
+  # every real verdict from consideration. Both misreport a genuinely
+  # at-head PR as "review unknown" with nothing on stderr. dev-2's catch.
+  if ! [[ "$CUTOVER" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    echo "ERROR: --cutover must be full ISO 8601 UTC, e.g. 2026-08-11T18:56:00Z. Got: '${CUTOVER}'" >&2
+    exit 1
+  fi
   shift 2
 fi
 
@@ -43,6 +52,7 @@ else
   prs=($(gh pr list -R "$REPO" --author @me --state open --json number --jq '.[].number'))
 fi
 
+all_clean=0
 for pr in "${prs[@]}"; do
   data=$(gh api graphql -f query='
     query($owner:String!,$name:String!,$n:Int!){
@@ -65,6 +75,10 @@ for pr in "${prs[@]}"; do
     '.data.repository.pullRequest.reviews.nodes
      | map(select(.author.login != "coderabbitai"))
      | map(select(.body | test($agent)))')
+  # Named "posted", not "open": this counts agent-tagged reviews carrying no
+  # verdict token, and checks nothing about thread resolution, so a finding
+  # answered weeks ago still counts. Renamed rather than taught to check
+  # resolution too — the tool's job is the verdict answer (dev-2/dispatcher).
   findings=$(echo "$reviews" | jq --arg re "$VERDICT_RE" '[.[] | select(.body | test($re) | not)] | length')
   # Filtered to submittedAt >= cutover on principle rather than because it can
   # currently fire: a review-shaped verdict cannot predate the mechanism that
@@ -75,7 +89,7 @@ for pr in "${prs[@]}"; do
     | if . then "\(.submittedAt)\t\(.author.login)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
       else "" end')
 
-  printf '#%s  head=%s  open findings=%s  ' "$pr" "${head:0:8}" "$findings"
+  printf '#%s  head=%s  findings posted=%s  ' "$pr" "${head:0:8}" "$findings"
 
   if [ -z "$latest" ]; then
     # No verdict-shaped REVIEW exists. Before cutover, verdicts were posted as
@@ -83,6 +97,7 @@ for pr in "${prs[@]}"; do
     # before calling this PR untouched rather than merely unconverted.
     any_activity=$(echo "$data" | jq --arg agent "$AGENT_RE" \
       "(.data.repository.pullRequest.reviews.nodes | map(select(.author.login != \"coderabbitai\")) | map(select(.body | test(\$agent))) | length) + (.data.repository.pullRequest.comments.nodes | map(select(.body | test(\$agent))) | length)")
+    all_clean=1
     if [ "$any_activity" -gt 0 ]; then
       printf 'verdict=review unknown (pre-cutover human activity, no review-shaped verdict)\n'
       continue
@@ -92,9 +107,19 @@ for pr in "${prs[@]}"; do
   fi
 
   IFS=$'\t' read -r vdate vauthor void vtype <<<"$latest"
-  if [ "$void" = "$head" ]; then
+  if [ "$void" = "$head" ] && [ "$vtype" = "pass" ] && [ "$findings" -eq 0 ]; then
+    printf 'verdict=pass by %s  AT HEAD\n' "$vauthor"
+  elif [ "$void" = "$head" ]; then
     printf 'verdict=%s by %s  AT HEAD\n' "$vtype" "$vauthor"
+    all_clean=1
   else
     printf 'verdict=%s by %s on %s  STALE (head has moved since)\n' "$vtype" "$vauthor" "${void:0:8}"
+    all_clean=1
   fi
 done
+
+# Exit 0 only when every checked PR is fully clean: a pass verdict, at head,
+# with no findings still lacking that verdict. Anything else — stale, absent,
+# review unknown, changes-needed, or an unconfirmed finding — exits 1, so a
+# caller (wi-1006 will be one) can branch on this without parsing text.
+exit "$all_clean"
