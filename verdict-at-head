@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# verdict-at-head — for a PR, is the newest peer verdict at head, stale, or absent?
+# Usage: verdict-at-head [--cutover ISO8601] [PR-number ...]
+#
+# The check dev-3 did by hand on #4171: pull comments and commits, compare
+# timestamps. Too costly to do on every push, so this automates the READING
+# only — it never comments, resolves a thread, or changes Patch state.
+#
+# A verdict is a review posted with event COMMENT, carrying [verdict: pass] or
+# [verdict: changes-needed] alongside the [agent dev-N] tag; the review object
+# carries the exact commit reviewed, so comparison is oid to oid, not
+# timestamps — a review that starts before a push and lands after it is newer
+# than head while describing the prior commit, so a timestamp reads it as
+# current and is wrong in the direction this exists to catch.
+#
+# A CodeRabbit review is never a verdict, at head or otherwise — excluded
+# regardless of what it says (dispatcher's ruling, 2026-08-11).
+#
+# PRE-CUTOVER PRs ARE UNASSESSABLE, NOT UNVERIFIED. The [verdict: ...]
+# convention requires agents to post verdicts as reviews, which nothing did
+# before the process prose said to. Reporting those PRs as never-verdicted
+# would be false and the fastest way to lose trust in this on its first run.
+# --cutover names the moment the prose changed; PRs whose only human activity
+# predates it report "review unknown", never "absent".
+set -euo pipefail
+
+REPO=EarlyAsset/earlyasset
+AGENT_RE='\[agent [a-z0-9-]+\]'
+VERDICT_RE='\[verdict: (pass|changes-needed)\]'
+
+# The process prose changed in metis's commit 9dd9ed5. Before that, nothing
+# had been told to post a verdict as a review, so no PR can fairly be judged
+# against a rule it didn't know about yet.
+CUTOVER="2026-08-11T18:56:00Z"
+if [ "${1:-}" = "--cutover" ]; then
+  CUTOVER="$2"
+  shift 2
+fi
+
+if [ "$#" -gt 0 ]; then
+  prs=("$@")
+else
+  prs=($(gh pr list -R "$REPO" --author @me --state open --json number --jq '.[].number'))
+fi
+
+for pr in "${prs[@]}"; do
+  data=$(gh api graphql -f query='
+    query($owner:String!,$name:String!,$n:Int!){
+      repository(owner:$owner,name:$name){
+        pullRequest(number:$n){
+          headRefOid
+          reviews(last:50){nodes{author{login} state submittedAt body commit{oid}}}
+          comments(last:50){nodes{author{login} body}}
+        }
+      }
+    }' -f owner=EarlyAsset -f name=earlyasset -F n="$pr")
+
+  head=$(echo "$data" | jq -r '.data.repository.pullRequest.headRefOid')
+
+  # A finding and a verdict are both authored by an agent, so the [agent ...]
+  # tag is required for either — an empty-body automated review (seen on
+  # #3403 from a non-agent account) is neither, and dropping the tag
+  # requirement counted it as a finding by accident on an earlier draft.
+  reviews=$(echo "$data" | jq --arg agent "$AGENT_RE" \
+    '.data.repository.pullRequest.reviews.nodes
+     | map(select(.author.login != "coderabbitai"))
+     | map(select(.body | test($agent)))')
+  findings=$(echo "$reviews" | jq --arg re "$VERDICT_RE" '[.[] | select(.body | test($re) | not)] | length')
+  # Filtered to submittedAt >= cutover on principle rather than because it can
+  # currently fire: a review-shaped verdict cannot predate the mechanism that
+  # makes reviews carry the token, but asserting that instead of checking it
+  # is exactly the kind of unverified assumption today cost us four times.
+  latest=$(echo "$reviews" | jq -r --arg re "$VERDICT_RE" --arg cutover "$CUTOVER" '
+    map(select(.body | test($re)) | select(.submittedAt >= $cutover)) | sort_by(.submittedAt) | last
+    | if . then "\(.submittedAt)\t\(.author.login)\t\(.commit.oid)\t\(.body | test("changes-needed") | if . then "changes-needed" else "pass" end)"
+      else "" end')
+
+  printf '#%s  head=%s  open findings=%s  ' "$pr" "${head:0:8}" "$findings"
+
+  if [ -z "$latest" ]; then
+    # No verdict-shaped REVIEW exists. Before cutover, verdicts were posted as
+    # plain comments — invisible to the reviews query — so check comments too
+    # before calling this PR untouched rather than merely unconverted.
+    any_activity=$(echo "$data" | jq --arg agent "$AGENT_RE" \
+      "(.data.repository.pullRequest.reviews.nodes | map(select(.author.login != \"coderabbitai\")) | map(select(.body | test(\$agent))) | length) + (.data.repository.pullRequest.comments.nodes | map(select(.body | test(\$agent))) | length)")
+    if [ "$any_activity" -gt 0 ]; then
+      printf 'verdict=review unknown (pre-cutover human activity, no review-shaped verdict)\n'
+      continue
+    fi
+    printf 'verdict=ABSENT\n'
+    continue
+  fi
+
+  IFS=$'\t' read -r vdate vauthor void vtype <<<"$latest"
+  if [ "$void" = "$head" ]; then
+    printf 'verdict=%s by %s  AT HEAD\n' "$vtype" "$vauthor"
+  else
+    printf 'verdict=%s by %s on %s  STALE (head has moved since)\n' "$vtype" "$vauthor" "${void:0:8}"
+  fi
+done
