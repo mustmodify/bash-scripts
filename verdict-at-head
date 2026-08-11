@@ -83,15 +83,33 @@ else
   # io-tower already parses for webhook attribution (dev.md: the fleet's only
   # authorship signal on a shared account is `branch.rpartition('--').last`).
   DEV_ID="${TRON_AGENT_NAME:-}"
-  branch=""
+  # TRON_AGENT_NAME wins outright when set — it identifies who is RUNNING the
+  # script, a stronger signal than whatever directory happens to be current.
+  # The branch fallback is different in kind: it trusts the CWD's git state,
+  # so before using it, confirm the CWD even points at this repo. ~/bin is one
+  # checkout shared by the whole fleet (see bin-is-one-shared-checkout) and
+  # can be sitting on ANOTHER agent's branch in ANOTHER repo at the moment
+  # this runs bare with no env var set — dev-2 confirmed it live, not as a
+  # hypothetical: found ~/bin checked out on grid-dev-1's branch of
+  # mustmodify/bash-scripts while testing, which would have labelled
+  # grid-dev-1's PRs as the calling agent's own with no hint anything was
+  # wrong. That is the exact failure this tool exists to catch, in itself.
   if [ -z "$DEV_ID" ]; then
+    remote=$(git remote get-url origin 2>/dev/null || true)
+    if ! [[ "$remote" =~ [:/]EarlyAsset/earlyasset(\.git)?$ ]]; then
+      echo "ERROR: can't determine which agent to scope to, and the current directory" >&2
+      echo "isn't a checkout of EarlyAsset/earlyasset (origin: '${remote:-none}'), so its" >&2
+      echo "branch can't be trusted to name the right agent. Set TRON_AGENT_NAME, cd into" >&2
+      echo "an earlyasset worktree on a --<agent-id> branch, or pass PR numbers explicitly." >&2
+      exit 1
+    fi
     branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
     DEV_ID="${branch##*--}"
-  fi
-  if [ -z "$DEV_ID" ] || [ "$DEV_ID" = "$branch" ]; then
-    echo "ERROR: can't determine which agent to scope to. Set TRON_AGENT_NAME," >&2
-    echo "run this from inside a --<agent-id> branch, or pass PR numbers explicitly." >&2
-    exit 1
+    if [ -z "$DEV_ID" ] || [ "$DEV_ID" = "$branch" ]; then
+      echo "ERROR: can't determine which agent to scope to. Set TRON_AGENT_NAME," >&2
+      echo "run this from inside a --<agent-id> branch, or pass PR numbers explicitly." >&2
+      exit 1
+    fi
   fi
   # gh's --jq takes one expression, not --arg — the suffix has to be baked
   # into the filter string, not passed as a jq variable the way a plain jq
