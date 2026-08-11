@@ -33,7 +33,10 @@ query($owner:String!, $name:String!, $endCursor:String) {
       nodes {
         number title createdAt url
         author { login __typename }
-        comments(last:100) { nodes { author { login } body } }
+        # first, not last: the walkthrough is posted at the start of a review,
+        # so the most-recent hundred drops it on a busy PR and reports a
+        # properly reviewed one as unreviewed (dev-3's catch).
+        comments(first:100) { nodes { author { login } body } }
         reviews(last:100) { nodes { author { login } } }
         reviewThreads(first:100) {
           nodes {
