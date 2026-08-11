@@ -5,6 +5,11 @@
 # A PR's checks answer what the BRANCH's CI said. The merge commit gets its own
 # run, and merges landing close together cancel each other's — so gh pr checks
 # cannot show whether what reached develop was ever verified. Reports only.
+#
+# Its job is detecting silence, so every bug it has is a way of being silent.
+# Three found so far all had that shape: a control passing on incidental
+# matches, a control sharing the query's own assumptions, and an inconclusive
+# path that swallowed the finding. Suspect that direction first.
 set -euo pipefail
 
 REPO=EarlyAsset/earlyasset
@@ -67,12 +72,25 @@ for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
   fi
 done
 
-# Eight recent merges with no run between them is the only symptom a wrong
-# workflow name produces, since it zeroes the join and the probe alike.
+# The newest merges having no runs is either the worst finding this tool can
+# make or a broken query. It must not exit on the first reading — swallowing
+# the finding is the failure dev-3 caught. Separated by whether OLDER merges
+# matched: a wrong workflow name matches nothing anywhere, while a real gap
+# leaves history intact. ("Does develop have runs at all" does NOT separate
+# them — point this at any real-but-wrong workflow and develop has plenty.)
 if [ "$probes_with_runs" -eq 0 ]; then
-  echo "CONTROL FAILED: none of the 8 sampled merges has a CI run by direct query." >&2
-  echo "Most likely the workflow name is wrong, which zeroes the join and the control alike." >&2
-  exit 2
+  # comm rather than a jq -e loop: under set -e, jq -e exits non-zero for a
+  # false result and killed this script silently — a bug shaped like the ones
+  # the header warns about, found by testing this very branch.
+  jq -r '.[].headSha' /tmp/mv-runs.$$ | sort -u > /tmp/mv-shas.$$
+  merges_with_runs=$(cut -f1 /tmp/mv-merges.$$ | sort -u | comm -12 - /tmp/mv-shas.$$ | wc -l)
+  if [ "$merges_with_runs" -eq 0 ]; then
+    echo "INCONCLUSIVE: not one merge in the window matches a run of this workflow," >&2
+    echo "so the name is the likely cause rather than a genuine gap. Nothing reported." >&2
+    exit 2
+  fi
+  echo "WARNING: $merges_with_runs older merges have runs, but none of the 8 newest does." >&2
+  echo "That is the finding, not a broken query. Report below." >&2
 fi
 
 printf 'MERGES TO DEVELOP, LAST %s DAYS — was the merge itself verified?\n\n' "$DAYS"
@@ -100,4 +118,4 @@ printf '\n"NO RUN" and "CANCELLED" both mean develop never verified that merge.\
 printf 'They differ in cause, not in consequence: cancelled by a following merge,\n'
 printf 'versus never triggered at all.\n'
 
-rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$ /tmp/mv-out.$$
+rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$ /tmp/mv-out.$$ /tmp/mv-shas.$$
