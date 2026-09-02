@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Usage: log <env-alias>
+# Tails logs for the matching Render service.
+#
+# Service names come from the same environment variables as `remote`:
+#   REMOTE_PRODUCTION_SERVICE  -> prod, production
+#   REMOTE_STAGING_SERVICE     -> s, staging
+
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "Usage: log <env-alias>" >&2
+  echo "  prod | production  -> \$REMOTE_PRODUCTION_SERVICE" >&2
+  echo "  s | staging        -> \$REMOTE_STAGING_SERVICE" >&2
+  exit 1
+fi
+
+case "$1" in
+  prod|production) var=REMOTE_PRODUCTION_SERVICE ;;
+  s|staging)       var=REMOTE_STAGING_SERVICE ;;
+  *)
+    echo "log: unknown alias '$1'" >&2
+    echo "Known: prod, production, s, staging" >&2
+    exit 1
+    ;;
+esac
+
+service="${!var-}"
+if [ -z "$service" ]; then
+  echo "log: $var is not set; add it to ~/.bashrc" >&2
+  exit 1
+fi
+
+exec render logs --resources "$service" --tail
