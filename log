@@ -2,22 +2,22 @@
 # Usage: log <env-alias>
 # Tails logs for the matching Render service.
 #
-# Service names come from the same environment variables as `remote`:
-#   REMOTE_PRODUCTION_SERVICE  -> prod, production
-#   REMOTE_STAGING_SERVICE     -> s, staging
+# Render service names come from the environment:
+#   RENDER_PRODUCTION_SERVICE  -> prod, production
+#   RENDER_STAGING_SERVICE     -> s, staging
 
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
   echo "Usage: log <env-alias>" >&2
-  echo "  prod | production  -> \$REMOTE_PRODUCTION_SERVICE" >&2
-  echo "  s | staging        -> \$REMOTE_STAGING_SERVICE" >&2
+  echo "  prod | production  -> \$RENDER_PRODUCTION_SERVICE" >&2
+  echo "  s | staging        -> \$RENDER_STAGING_SERVICE" >&2
   exit 1
 fi
 
 case "$1" in
-  prod|production) var=REMOTE_PRODUCTION_SERVICE ;;
-  s|staging)       var=REMOTE_STAGING_SERVICE ;;
+  prod|production) var=RENDER_PRODUCTION_SERVICE ;;
+  s|staging)       var=RENDER_STAGING_SERVICE ;;
   *)
     echo "log: unknown alias '$1'" >&2
     echo "Known: prod, production, s, staging" >&2
