@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# merge-verified — did each merge to develop actually get its CI run?
+# Usage: merge-verified [days] (default 7), or --self-test
+#
+# A PR's checks answer what the BRANCH's CI said. The merge commit gets its own
+# run, and merges landing close together cancel each other's — so gh pr checks
+# cannot show whether what reached develop was ever verified. Reports only.
+#
+# Its job is detecting silence, so every bug it has is a way of being silent.
+# Three found so far all had that shape: a control passing on incidental
+# matches, a control sharing the query's own assumptions, and an inconclusive
+# path that swallowed the finding. Suspect that direction first.
+set -euo pipefail
+
+REPO=EarlyAsset/earlyasset
+
+if [ "${1:-}" = "--self-test" ]; then
+  full=$(gh api "repos/$REPO/commits?sha=develop&per_page=1" --jq '.[0].sha')
+  n_full=$(gh run list -R "$REPO" --commit "$full" --workflow CI --limit 5 --json conclusion --jq 'length')
+  n_short=$(gh run list -R "$REPO" --commit "${full:0:8}" --workflow CI --limit 5 --json conclusion --jq 'length')
+  echo "full SHA ${full:0:8}...: $n_full run(s);  abbreviated: $n_short run(s)"
+  if [ "$n_full" -eq 0 ]; then
+    echo "INCONCLUSIVE: newest merge has no run yet, so the comparison proves nothing. Retry later." >&2
+    exit 2
+  fi
+  [ "$n_short" -eq 0 ] && echo "PASS: an abbreviated SHA does silently return nothing, and this script only ever passes 40 chars." && exit 0
+  echo "UNEXPECTED: the abbreviated SHA matched. gh behaviour has changed; re-read the control." >&2
+  exit 2
+fi
+
+DAYS=${1:-7}
+SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d)
+
+# --paginate because 56 merges landed in four days: a truncated page would
+# under-report exactly the unverified merges this exists to find.
+gh api --paginate "repos/$REPO/commits?sha=develop&since=${SINCE}T00:00:00Z&per_page=100" \
+  --jq '.[] | [.sha, (.commit.message | split("\n")[0])] | @tsv' > /tmp/mv-merges.$$
+
+gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
+  --json headSha,status,conclusion > /tmp/mv-runs.$$
+
+# The control cross-checks a DIFFERENT code path, not this query's own output.
+# Two earlier versions could pass while the query was broken: one asked merely
+# whether any merge matched (three incidental matches let it through), and one
+# shared --workflow with the query, so a wrong name zeroed both and the
+# disagreement could never fire. A control that inherits the wrong query's
+# assumptions is not a control.
+# A quiet weekend is not a broken query: with no merges the loop never runs,
+# both counters stay zero, and every check below would blame the workflow name.
+if [ ! -s /tmp/mv-merges.$$ ]; then
+  echo "No merges to develop in the last $DAYS days. Nothing to verify."
+  rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$
+  exit 0
+fi
+
+probes_with_runs=0
+for probe in $(cut -f1 /tmp/mv-merges.$$ | head -8); do
+  # --commit silently returns nothing for a short SHA, which would report NO RUN
+  # for a merge that ran — wrong in the same direction as the bug.
+  if [ ${#probe} -ne 40 ]; then
+    echo "CONTROL FAILED: probe SHA ${probe} is ${#probe} chars, not 40." >&2
+    exit 2
+  fi
+  direct=$(gh run list -R "$REPO" --commit "$probe" --workflow CI --limit 5 --json conclusion --jq 'length')
+  joined=$(jq -r --arg s "$probe" '[.[] | select(.headSha == $s)] | length' /tmp/mv-runs.$$)
+  [ "$direct" -gt 0 ] && probes_with_runs=$((probes_with_runs + 1))
+  if [ "$direct" -gt 0 ] && [ "$joined" -eq 0 ]; then
+    # Re-read before failing. GitHub serves inconsistent data across its own
+    # endpoints, and this control fired once on a merge whose run both queries
+    # agreed about seconds later. A control that cries wolf on ordinary lag
+    # gets ignored, which costs more than the case it guards.
+    gh run list -R "$REPO" --branch develop --workflow CI --limit 300 \
+      --json headSha,status,conclusion > /tmp/mv-runs.$$
+    joined=$(jq -r --arg s "$probe" '[.[] | select(.headSha == $s)] | length' /tmp/mv-runs.$$)
+    if [ "$joined" -eq 0 ]; then
+      echo "CONTROL FAILED: ${probe:0:8} has $direct CI run(s) by direct query, none by the join," >&2
+      echo "and still none after a re-read. Do not report these numbers." >&2
+      exit 2
+    fi
+  fi
+done
+
+# The newest merges having no runs is either the worst finding this tool can
+# make or a broken query. It must not exit on the first reading — swallowing
+# the finding is the failure dev-3 caught. Separated by whether OLDER merges
+# matched: a wrong workflow name matches nothing anywhere, while a real gap
+# leaves history intact. ("Does develop have runs at all" does NOT separate
+# them — point this at any real-but-wrong workflow and develop has plenty.)
+if [ "$probes_with_runs" -eq 0 ]; then
+  # comm rather than a jq -e loop: under set -e, jq -e exits non-zero for a
+  # false result and killed this script silently — a bug shaped like the ones
+  # the header warns about, found by testing this very branch.
+  jq -r '.[].headSha' /tmp/mv-runs.$$ | sort -u > /tmp/mv-shas.$$
+  merges_with_runs=$(cut -f1 /tmp/mv-merges.$$ | sort -u | comm -12 - /tmp/mv-shas.$$ | wc -l)
+  if [ "$merges_with_runs" -eq 0 ]; then
+    echo "INCONCLUSIVE: not one merge in the window matches a run of this workflow," >&2
+    echo "so the name is the likely cause rather than a genuine gap. Nothing reported." >&2
+    exit 2
+  fi
+  echo "WARNING: $merges_with_runs older merges have runs, but none of the 8 newest does." >&2
+  echo "That is the finding, not a broken query. Report below." >&2
+fi
+
+printf 'MERGES TO DEVELOP, LAST %s DAYS — was the merge itself verified?\n\n' "$DAYS"
+while IFS=$'\t' read -r sha subject; do
+  pr=$(printf '%s' "$subject" | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' || true)
+  verdict=$(jq -r --arg s "$sha" '
+    [.[] | select(.headSha == $s)] as $runs
+    | if ($runs | length) == 0 then "NO RUN"
+      elif ($runs | map(select(.conclusion == "success")) | length) > 0 then "verified"
+      elif ($runs | map(select(.conclusion == "cancelled")) | length) > 0 then "CANCELLED"
+      elif ($runs | map(select(.status != "completed")) | length) > 0 then "running"
+      else "FAILED: " + ($runs[0].conclusion // "?") end' /tmp/mv-runs.$$)
+  printf '  %s  %-9s  %s\n' "${sha:0:8}" "${pr:+#$pr}" "$verdict"
+done < /tmp/mv-merges.$$ | tee /tmp/mv-out.$$
+
+printf '\n%s merges: %s verified, %s cancelled, %s with no run, %s failed, %s still running.\n' \
+  "$(wc -l < /tmp/mv-merges.$$)" \
+  "$(grep -c ' verified$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' CANCELLED$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' NO RUN$' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' FAILED' /tmp/mv-out.$$ || true)" \
+  "$(grep -c ' running$' /tmp/mv-out.$$ || true)"
+
+printf '\n"NO RUN" and "CANCELLED" both mean develop never verified that merge.\n'
+printf 'They differ in cause, not in consequence: cancelled by a following merge,\n'
+printf 'versus never triggered at all.\n'
+
+rm -f /tmp/mv-merges.$$ /tmp/mv-runs.$$ /tmp/mv-out.$$ /tmp/mv-shas.$$

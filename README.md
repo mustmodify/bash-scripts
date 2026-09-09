@@ -30,6 +30,7 @@ GitHub
 | Script | Description |
 |--------|-------------|
 | `tlist [status]` | List tickets from GitHub Project Board. Requires `GITHUB_ORG` and `GITHUB_PROJECT_NUMBER` env vars. |
+| `merge-verified [days]` | Which merges to develop actually got a completed CI run. `--self-test` checks its own control. Read-only. |
 
 Rails
 --------------------
